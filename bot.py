@@ -595,7 +595,75 @@ async def voice_reset(ctx: discord.ApplicationContext):
     await asyncio.sleep(2.5)
 
     await ctx.respond("✅ Voice state cleared. Try **Start Recording** again in your voice channel.", ephemeral=True)
+@bot.tree.command(name="voice_reset", description="Force-reset the voice session in this server")
+async def voice_reset_cmd(interaction: discord.Interaction):
+    """Slash command: /voice_reset"""
+    if interaction.guild is None:
+        await interaction.response.send_message("This must be used in a server.", ephemeral=True)
+        return
+    if not interaction.user.guild_permissions.manage_channels:
+        await interaction.response.send_message("❌ You need 'Manage Channels' to use this.", ephemeral=True)
+        return
 
+    # Stop recording & disconnect if connected
+    vc = interaction.guild.voice_client
+    if vc:
+        if hasattr(vc, "stop_recording"):
+            try:
+                vc.stop_recording()
+            except Exception:
+                pass
+        try:
+            await vc.disconnect(force=True)
+        except Exception:
+            pass
+
+    # Clear voice state on Discord's side
+    try:
+        await interaction.guild.change_voice_state(channel=None, self_mute=True, self_deaf=True)
+    except Exception:
+        pass
+
+    # Small pause so Discord fully drops the session
+    await asyncio.sleep(2.0)
+
+    await interaction.response.send_message("🔧 Voice state reset for this server. Try connecting again.", ephemeral=True)
+
+
+@bot.command(name="voice_reset")
+@commands.has_guild_permissions(manage_channels=True)
+async def voice_reset_legacy(ctx: commands.Context):
+    """Prefix command: !voice_reset"""
+    guild = ctx.guild
+    if guild is None:
+        await ctx.reply("This must be used in a server.", mention_author=False)
+        return
+
+    vc = guild.voice_client
+    if vc:
+        if hasattr(vc, "stop_recording"):
+            try:
+                vc.stop_recording()
+            except Exception:
+                pass
+        try:
+            await vc.disconnect(force=True)
+        except Exception:
+            pass
+
+    try:
+        await guild.change_voice_state(channel=None, self_mute=True, self_deaf=True)
+    except Exception:
+        pass
+
+    await asyncio.sleep(2.0)
+    await ctx.reply("🔧 Voice state reset for this server. Try connecting again.", mention_author=False)
+
+
+@voice_reset_legacy.error
+async def voice_reset_legacy_error(ctx: commands.Context, error: Exception):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.reply("❌ You need 'Manage Channels' to use this.", mention_author=False)
 
 # Entrypoint
 if __name__ == "__main__":
