@@ -1,65 +1,109 @@
 # text_clean.py
+# Lightweight, dependency-free(ish) transcript cleaner for ASR output.
+# Use: polished = clean_transcript(text)
+
+from __future__ import annotations
 import re
+from typing import Iterable, Optional
 
-# Optional niceties: work even if not installed
+# Optional niceties — if not installed, we fall back gracefully.
 try:
-    from ftfy import fix_text       # unicode cleanup
+    from ftfy import fix_text  # unicode/quotes cleanup
 except Exception:
-    fix_text = lambda s: s
+    fix_text = lambda s: s  # no-op if ftfy isn't available
 
 try:
-    import smartypants as _sp       # curly quotes/dashes (optional)
+    import smartypants as _sp  # curly quotes / dashes
 except Exception:
     _sp = None
 
-# Join spaced letters like "D i a d e m" -> "Diadem", "R y a n" -> "Ryan"
-_SPACED_LETTERS = re.compile(r"\b(?:[A-Za-z]\s){2,}[A-Za-z]\b")
+# Match sequences like "D i a d e m", "R y a n", "L O L" (>=3 letters)
+# Allow one or more spaces between letters to be robust to ASR spacing.
+_SPACED_LETTERS = re.compile(r"\b(?:[A-Za-z]\s+){2,}[A-Za-z]\b")
 
-def _collapse_spelled_words(s: str, protected: set | None = None) -> str:
+# Basic punctuation/spacing normalisation
+_SPACES_BEFORE_PUNCT = re.compile(r"\s+([,.;:!?])")
+_NO_SPACE_AFTER_ENDER = re.compile(r"([.!?])([^\s])")
+_MULTI_SPACE = re.compile(r"\s{2,}")
+_SPACED_APOSTROPHE = re.compile(r"\s+'\s*|\s*'\s+")  # e.g., "it ' s" → "it's"
+_DASH_FIX = re.compile(r"\s*[-–—]{1,2}\s*")          # normalize dashes to " — "
+
+def _collapse_spelled_words(s: str, protected: set[str] | None = None) -> str:
+    """Join space-separated letters into words, except those in `protected`."""
     if not s:
         return s
-    def repl(m):
+
+    def repl(m: re.Match) -> str:
         token = m.group(0)
-        joined = token.replace(" ", "")
+        joined = re.sub(r"\s+", "", token)
         if protected and (token in protected or joined in protected):
             return token
         return joined
+
     return _SPACED_LETTERS.sub(repl, s)
 
 def _normalize_spacing_punct(s: str) -> str:
-    # remove spaces before punctuation, ensure one space after sentence enders, collapse doubles
-    s = re.sub(r"\s+([,.;:!?])", r"\1", s)
-    s = re.sub(r"([.!?])([^\s])", r"\1 \2", s)
-    s = re.sub(r"\s{2,}", " ", s)
+    """Fix spacing around punctuation and dashes; collapse multiple spaces."""
+    if not s:
+        return s
+    s = _SPACES_BEFORE_PUNCT.sub(r"\1", s)
+    s = _NO_SPACE_AFTER_ENDER.sub(r"\1 \2", s)
+    # Normalize em/en dashes to spaced em-dash style (ASCII-safe if smart quotes disabled)
+    s = _DASH_FIX.sub(" — ", s)
+    # Fix "it ' s" → "it's"
+    s = _SPACED_APOSTROPHE.sub("'", s)
+    # Collapse extra spaces
+    s = _MULTI_SPACE.sub(" ", s)
     return s.strip()
 
-def _sentence_case(s: str) -> str:
-    # capitalize first alphabetic character in a sentence
-    for i, ch in enumerate(s.lstrip()):
-        if ch.isalpha():
-            lead = s[:len(s) - len(s.lstrip())]
-            return lead + s.lstrip()[:i] + ch.upper() + s.lstrip()[i+1:]
-    return s
+def _sentence_case_once(chunks: list[str]) -> list[str]:
+    """Capitalize the first alphabetic character in each chunk (sentence)."""
+    out = []
+    for c in chunks:
+        i = 0
+        # Preserve leading whitespace
+        while i < len(c) and c[i].isspace():
+            i += 1
+        # Find first alpha to capitalize
+        j = i
+        while j < len(c) and not c[j].isalpha():
+            j += 1
+        if j < len(c):
+            c = c[:j] + c[j].upper() + c[j+1:]
+        out.append(c)
+    return out
 
 def _split_sentences(s: str) -> list[str]:
+    """Lightweight split on sentence enders followed by whitespace."""
+    # Keep enders . ! ? and split when followed by space/newline
     return re.split(r"(?<=[.!?])\s+", s)
 
 def clean_transcript(
     text: str,
+    *,
     collapse_spelled: bool = True,
     enforce_sentence_case: bool = True,
     normalize_punct: bool = True,
-    glossary: list[str] | None = None,      # e.g. ["Diadem", "Vurndharth", "Saphryn"]
-    protected_spelled: list[str] | None = None,  # spelled forms you DON'T want joined
-    smart_quotes: bool = False
+    glossary: Optional[Iterable[str]] = None,        # e.g. ["Diadem", "Vurndharth", "Saphryn"]
+    protected_spelled: Optional[Iterable[str]] = None, # e.g. ["S M H"] to keep spaced
+    smart_quotes: bool = False                         # set True if you installed smartypants
 ) -> str:
     """
-    Light, fast post-process for ASR output. No network calls.
+    Post-process raw ASR text into something cleaner:
+
+    - Collapses spaced-out letters ("D i a d e m" → "Diadem")
+    - Normalizes punctuation & spacing
+    - Capitalizes sentence starts
+    - Optionally enforces preferred casing for specific terms (glossary)
+    - Optionally applies smart quotes/dashes (if `smartypants` installed)
+
+    All operations are local (no network calls).
     """
     if not text:
         return text
 
-    out = fix_text(text)  # unicode / weird quotes, if ftfy available
+    # Unicode cleanup if ftfy exists (smart quotes, broken accents, etc.)
+    out = fix_text(text)
 
     if collapse_spelled:
         out = _collapse_spelled_words(out, set(protected_spelled or []))
@@ -68,11 +112,11 @@ def clean_transcript(
         out = _normalize_spacing_punct(out)
 
     if enforce_sentence_case:
-        sents = [_sentence_case(s) for s in _split_sentences(out)]
-        out = " ".join(sents)
+        sentences = _split_sentences(out)
+        out = " ".join(_sentence_case_once(sentences))
 
     if glossary:
-        # Canonicalize key terms’ casing (case-insensitive replace)
+        # Canonicalize key terms’ casing (case-insensitive word-boundary replace)
         for term in glossary:
             out = re.sub(rf"\b{re.escape(term)}\b", term, out, flags=re.IGNORECASE)
 
