@@ -18,7 +18,7 @@ import speech_recognition as sr
 # Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("LeoScribeBot")
-# For deeper debugging:
+# Uncomment for very verbose library logs:
 # logging.getLogger("discord").setLevel(logging.DEBUG)
 
 # Local modules
@@ -61,8 +61,8 @@ class UserAudioBuffer:
         return time.time() - self.last_received > threshold_seconds
 
 # ─────────────────────────────
-# Pycord WaveSink for recording
-# Pycord calls: sink.write(pcm_bytes: bytes, user_id: int)
+# WaveSink for recording (Pycord)
+# sink.write(pcm_bytes: bytes, user_id: int)
 # ─────────────────────────────
 class TranscriptionSink(discord.sinks.WaveSink):
     def __init__(self, bot: "LeoScribeBot", channel: discord.abc.Messageable):
@@ -84,7 +84,7 @@ class TranscriptionSink(discord.sinks.WaveSink):
         if not audio_data:
             return
         try:
-            # Wrap PCM in WAV for SpeechRecognition
+            # Wrap raw PCM in WAV header for SpeechRecognition
             audio_io = io.BytesIO()
             with wave.open(audio_io, "wb") as wav_file:
                 wav_file.setnchannels(2)      # stereo
@@ -212,28 +212,54 @@ class TranscriptionView(discord.ui.View):
                 pass
             return
 
-        # Optional guard: if a VoiceClient is already attached, try to reuse/move it
+        # Reuse/move existing VoiceClient if possible
         existing_vc = interaction.guild.voice_client if interaction.guild else None
         if existing_vc and existing_vc.is_connected():
             if existing_vc.channel.id != voice_channel.id:
                 try:
                     await existing_vc.move_to(voice_channel)
                 except Exception:
-                    # If move fails, connect_voice_fresh will handle reset/reconnect
-                    pass
+                    pass  # connect_voice_fresh will handle reset
 
-        # ---- Voice connect with 4006 retry ----
+        # ---- Voice connect with 4006 retry handling ----
         try:
             voice_client = await connect_voice_fresh(interaction.guild, voice_channel)
             await asyncio.sleep(0.5)
 
         except discord.errors.ConnectionClosed as e:
-            # Some guilds/channels throw a first-time 4006 invalid session.
-            if getattr(e, "code", None) == 4006:
+            code = getattr(e, "code", None)
+            if code == 4006:
                 logger.warning("Voice WS 4006 on first attempt; hard-resetting and retrying once…")
-                await asyncio.sleep(1.5)  # let Discord drop the bad session
-                voice_client = await connect_voice_fresh(interaction.guild, voice_channel)
-                await asyncio.sleep(0.5)
+                # Extra nuke from client side
+                try:
+                    await interaction.guild.change_voice_state(channel=None, self_mute=True, self_deaf=True)
+                except Exception:
+                    pass
+                await asyncio.sleep(2.5)
+                # IMPORTANT: wrap the second attempt too
+                try:
+                    voice_client = await connect_voice_fresh(interaction.guild, voice_channel)
+                    await asyncio.sleep(0.5)
+                except discord.errors.ConnectionClosed as e2:
+                    logger.error(f"Voice WS {getattr(e2,'code',None)} again on retry; giving up cleanly.")
+                    new_view = TranscriptionView(self.bot, gid)
+                    await interaction.message.edit(
+                        embed=new_view.get_status_embed(
+                            "❌ Error",
+                            "Voice gateway invalid session (4006) twice.\n"
+                            "Tip: Toggle the voice channel’s **RTC Region** off/Automatic, or recreate the channel."
+                        ),
+                        view=new_view,
+                    )
+                    try:
+                        await interaction.followup.send(
+                            "❌ Voice gateway invalid session (4006) twice. "
+                            "Try toggling the channel **RTC Region** or recreating the voice channel.",
+                            ephemeral=True,
+                        )
+                    except Exception:
+                        pass
+                    return
             else:
                 logger.error(f"Unexpected ConnectionClosed during start: {e}")
                 new_view = TranscriptionView(self.bot, gid)
