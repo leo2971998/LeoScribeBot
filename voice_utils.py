@@ -1,3 +1,4 @@
+# voice_utils.py
 import asyncio
 import logging
 import discord
@@ -5,10 +6,30 @@ import discord
 logger = logging.getLogger(__name__)
 
 class VoiceConnectError(Exception):
+    """Raised when voice connection fails after retries"""
     pass
 
+def ensure_opus_loaded():
+    """Ensure Opus codec is loaded for voice functionality."""
+    try:
+        if not discord.opus.is_loaded():
+            for lib in ('libopus.so.0', 'libopus.so', 'opus'):
+                try:
+                    discord.opus.load_opus(lib)
+                    logger.info(f"Loaded Opus library: {lib}")
+                    break
+                except OSError:
+                    continue
+            else:
+                logger.warning("Could not load Opus. Install libopus0 (apt) and ffmpeg.")
+    except Exception as e:
+        logger.warning(f"Opus loading failed: {e}")
+
 async def connect_voice_fresh(guild: discord.Guild, channel: discord.VoiceChannel) -> discord.VoiceClient:
-    """Hard-reset any existing voice, then connect with controlled retries/backoff."""
+    """
+    Hard-reset any existing voice, then connect with controlled retries/backoff.
+    Handles common WS codes like 4006 (invalid session), 4009 (timeout), 4014 (kicked/perm change).
+    """
     # Kill any old connection first
     if guild.voice_client:
         try:
@@ -26,16 +47,16 @@ async def connect_voice_fresh(guild: discord.Guild, channel: discord.VoiceChanne
     for attempt in range(1, 6):
         try:
             logger.info(f"Voice connect attempt {attempt} for guild '{guild.name}'")
-            # IMPORTANT: no self_deaf here (not supported in your build)
+            # IMPORTANT: your Pycord build doesn't accept self_deaf here
             vc = await channel.connect(timeout=15, reconnect=False)
 
-            # Optionally self-deafen AFTER connecting (best-effort)
+            # Optional: self-deafen AFTER connecting (best-effort; not all builds support this)
             try:
                 await guild.change_voice_state(channel=channel, self_deaf=True, self_mute=False)
             except Exception:
                 pass
 
-            # Wait for ready
+            # Wait until ready
             for _ in range(40):  # up to ~10s
                 if vc.is_connected():
                     logger.info(f"Voice connected successfully to {channel.name}")
