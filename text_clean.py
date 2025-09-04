@@ -1,10 +1,10 @@
 # text_clean.py
-# Lightweight, dependency-free(ish) transcript cleaner for ASR output.
+# General, dependency-light transcript cleaner (no hard-coded vocab).
 # Use: polished = clean_transcript(text)
 
 from __future__ import annotations
 import re
-from typing import Iterable, Optional
+from typing import Optional, Iterable
 
 # Optional niceties — if not installed, we fall back gracefully.
 try:
@@ -17,16 +17,25 @@ try:
 except Exception:
     _sp = None
 
-# Match sequences like "D i a d e m", "R y a n", "L O L" (>=3 letters)
-# Allow one or more spaces between letters to be robust to ASR spacing.
+# ─────────────────────────────
+# Core regex
+# ─────────────────────────────
+
+# Join sequences like "D i a d e m", "R y a n", "L O L" (>=3 letters)
 _SPACED_LETTERS = re.compile(r"\b(?:[A-Za-z]\s+){2,}[A-Za-z]\b")
 
-# Basic punctuation/spacing normalisation
-_SPACES_BEFORE_PUNCT = re.compile(r"\s+([,.;:!?])")
+# Basic punctuation/spacing normalization
+_SPACES_BEFORE_PUNCT  = re.compile(r"\s+([,.;:!?])")
 _NO_SPACE_AFTER_ENDER = re.compile(r"([.!?])([^\s])")
-_MULTI_SPACE = re.compile(r"\s{2,}")
-_SPACED_APOSTROPHE = re.compile(r"\s+'\s*|\s*'\s+")  # e.g., "it ' s" → "it's"
-_DASH_FIX = re.compile(r"\s*[-–—]{1,2}\s*")          # normalize dashes to " — "
+_MULTI_SPACE          = re.compile(r"\s{2,}")
+_SPACED_APOSTROPHE    = re.compile(r"\s+'\s*|\s*'\s+")  # "it ' s" → "it's"
+_DASH_FIX             = re.compile(r"\s*[-–—]{1,2}\s*") # normalize to spaced em-dash
+
+_WORD = re.compile(r"\S+")
+
+# ─────────────────────────────
+# Helpers
+# ─────────────────────────────
 
 def _collapse_spelled_words(s: str, protected: set[str] | None = None) -> str:
     """Join space-separated letters into words, except those in `protected`."""
@@ -48,23 +57,22 @@ def _normalize_spacing_punct(s: str) -> str:
         return s
     s = _SPACES_BEFORE_PUNCT.sub(r"\1", s)
     s = _NO_SPACE_AFTER_ENDER.sub(r"\1 \2", s)
-    # Normalize em/en dashes to spaced em-dash style (ASCII-safe if smart quotes disabled)
-    s = _DASH_FIX.sub(" — ", s)
-    # Fix "it ' s" → "it's"
+    s = _DASH_FIX.sub(" — ", s)       # normalize to spaced em-dash
     s = _SPACED_APOSTROPHE.sub("'", s)
-    # Collapse extra spaces
     s = _MULTI_SPACE.sub(" ", s)
     return s.strip()
 
+def _split_sentences(s: str) -> list[str]:
+    """Split on sentence enders (. ! ?) keeping the ender."""
+    return re.split(r"(?<=[.!?])\s+", s)
+
 def _sentence_case_once(chunks: list[str]) -> list[str]:
-    """Capitalize the first alphabetic character in each chunk (sentence)."""
+    """Capitalize the first alphabetic character in each chunk."""
     out = []
     for c in chunks:
         i = 0
-        # Preserve leading whitespace
         while i < len(c) and c[i].isspace():
             i += 1
-        # Find first alpha to capitalize
         j = i
         while j < len(c) and not c[j].isalpha():
             j += 1
@@ -73,10 +81,99 @@ def _sentence_case_once(chunks: list[str]) -> list[str]:
         out.append(c)
     return out
 
-def _split_sentences(s: str) -> list[str]:
-    """Lightweight split on sentence enders followed by whitespace."""
-    # Keep enders . ! ? and split when followed by space/newline
-    return re.split(r"(?<=[.!?])\s+", s)
+def _word_count(text: str) -> int:
+    return len([m.group(0) for m in _WORD.finditer(text)])
+
+def _insert_commas_by_clause_length(
+    s: str,
+    *,
+    min_left_words: int = 8,
+    min_right_words: int = 4,
+    max_commas: int = 2,
+) -> str:
+    """
+    Purely structural comma insertion:
+    - Look for natural breakpoints inside long runs.
+    - A breakpoint is between tokens where:
+        • left clause has ≥ min_left_words
+        • right clause has ≥ min_right_words
+        • the char before the break isn't already punctuation
+        • the next token starts with a lowercase letter (indicating continuation)
+    - Insert at most `max_commas` per sentence.
+    No keyword lists; language-agnostic heuristic.
+    """
+    if not s:
+        return s
+
+    # Work sentence by sentence so we don't create comma chains across boundaries.
+    parts = _split_sentences(s)
+    new_parts: list[str] = []
+
+    for sent in parts:
+        if not sent or _word_count(sent) < (min_left_words + min_right_words + 2):
+            new_parts.append(sent)
+            continue
+
+        # Tokenize with positions
+        tokens = list(_WORD.finditer(sent))
+        if len(tokens) < 3:
+            new_parts.append(sent)
+            continue
+
+        inserted = 0
+        offset = 0  # running offset from prior insertions
+        sent_mutable = sent
+
+        # Scan for breakpoints; allow multiple (up to max_commas)
+        for i in range(1, len(tokens)):
+            if inserted >= max_commas:
+                break
+
+            t = tokens[i]
+            cut = t.start() + offset
+
+            # Skip if at very start
+            if cut <= 0 or cut >= len(sent_mutable):
+                continue
+
+            # Preceding character cannot be punctuation
+            prev_char = sent_mutable[cut - 1]
+            if prev_char in ",;:—-(":
+                continue
+
+            # Next token should likely be a continuation, not a new sentence:
+            tok_text = t.group(0)
+            if not tok_text or not tok_text[0].islower():
+                # Require lowercase start for "continuation" feel (generic).
+                continue
+
+            # Word counts on either side
+            left_wc = _word_count(sent_mutable[:cut])
+            right_wc = _word_count(sent_mutable[cut:])
+
+            if left_wc >= min_left_words and right_wc >= min_right_words:
+                # Insert comma at boundary, cleaning spaces around insertion.
+                left = sent_mutable[:cut].rstrip()
+                right = sent_mutable[cut:].lstrip()
+                new_sent = f"{left}, {right}"
+
+                # Update bookkeeping: how many chars did we add?
+                delta = len(new_sent) - len(sent_mutable)
+                sent_mutable = new_sent
+                offset += delta
+                inserted += 1
+
+        new_parts.append(sent_mutable)
+
+    # Re-join sentences with a single space (they already include enders).
+    s2 = " ".join(new_parts)
+    # Final spacing cleanup
+    s2 = _normalize_spacing_punct(s2)
+    return s2
+
+# ─────────────────────────────
+# Public API
+# ─────────────────────────────
 
 def clean_transcript(
     text: str,
@@ -84,25 +181,28 @@ def clean_transcript(
     collapse_spelled: bool = True,
     enforce_sentence_case: bool = True,
     normalize_punct: bool = True,
-    glossary: Optional[Iterable[str]] = None,        # e.g. ["Diadem", "Vurndharth", "Saphryn"]
-    protected_spelled: Optional[Iterable[str]] = None, # e.g. ["S M H"] to keep spaced
-    smart_quotes: bool = False                         # set True if you installed smartypants
+    glossary: Optional[Iterable[str]] = None,          # you can pass terms at runtime if you want
+    protected_spelled: Optional[Iterable[str]] = None, # terms to *not* collapse if needed
+    smart_quotes: bool = False,                        # enable if `smartypants` installed
+    light_punct: bool = True,                          # structural commas (no keyword lists)
+    min_left_words: int = 8,
+    min_right_words: int = 4,
+    max_commas_per_sentence: int = 2,
 ) -> str:
     """
-    Post-process raw ASR text into something cleaner:
+    General ASR post-processing:
+      • Join spaced letters  (D i a d e m → Diadem)
+      • Normalize spacing/punctuation
+      • (Optional) add ≤ `max_commas_per_sentence` commas using clause-length heuristics
+      • Sentence-case the start of sentences
+      • Optional glossary to enforce casing (runtime, not hard-coded)
+      • Optional smart quotes/dashes
 
-    - Collapses spaced-out letters ("D i a d e m" → "Diadem")
-    - Normalizes punctuation & spacing
-    - Capitalizes sentence starts
-    - Optionally enforces preferred casing for specific terms (glossary)
-    - Optionally applies smart quotes/dashes (if `smartypants` installed)
-
-    All operations are local (no network calls).
+    All offline; no word- or story-specific lists.
     """
     if not text:
         return text
 
-    # Unicode cleanup if ftfy exists (smart quotes, broken accents, etc.)
     out = fix_text(text)
 
     if collapse_spelled:
@@ -110,6 +210,14 @@ def clean_transcript(
 
     if normalize_punct:
         out = _normalize_spacing_punct(out)
+
+    if light_punct:
+        out = _insert_commas_by_clause_length(
+            out,
+            min_left_words=min_left_words,
+            min_right_words=min_right_words,
+            max_commas=max_commas_per_sentence,
+        )
 
     if enforce_sentence_case:
         sentences = _split_sentences(out)
