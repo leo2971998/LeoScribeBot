@@ -1,321 +1,269 @@
-"""
-Optimized Whisper-based speech recognition for LeoScribeBot
-Performance-focused implementation for real-time transcription
-"""
+# whisper_utils.py
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+from __future__ import annotations
 
 import asyncio
-import io
-import logging
+import os
 import time
-import wave
-from pathlib import Path
-from typing import Optional, Union
+import shutil
+import tempfile
+import subprocess
+from typing import Optional, Dict, Any
 
-logger = logging.getLogger(__name__)
+import numpy as np
 
-# Global whisper model instance for efficiency
-_whisper_model = None
+# -----------------------------
+# Backend detection (prefer whispercpp)
+# -----------------------------
+_BACKEND = None          # "whispercpp" | "whisper_cpp_python" | None
+_Whisper = None          # bound class/type
+_BACKEND_NOTE = ""
 
-# Fallback flag for environments where whisper isn't available
-WHISPER_AVAILABLE = False
-
-# Try importing whisper with graceful fallback
 try:
-    import whisper
-    WHISPER_AVAILABLE = True
-    logger.info("Whisper available for optimized speech recognition")
-except ImportError:
-    logger.warning("Whisper not available - falling back to Google Speech Recognition")
-    whisper = None
+    # aarnphm/whispercpp: pip install whispercpp ; from whispercpp import Whisper
+    from whispercpp import Whisper as _Whisper  # type: ignore
+    _BACKEND = "whispercpp"
+    _BACKEND_NOTE = "using whispercpp (Pybind11) backend"
+except Exception:
+    try:
+        # pip install whisper-cpp-python ; from whisper_cpp_python import Whisper
+        from whisper_cpp_python import Whisper as _Whisper  # type: ignore
+        _BACKEND = "whisper_cpp_python"
+        _BACKEND_NOTE = "using whisper-cpp-python backend"
+    except Exception:
+        _BACKEND = None
+        _Whisper = None
+        _BACKEND_NOTE = "no whisper.cpp backend available"
 
-# Also try SpeechRecognition as backup
-try:
-    import speech_recognition as sr
-    SPEECH_RECOGNITION_AVAILABLE = True
-except ImportError:
-    logger.error("SpeechRecognition not available - no fallback possible")
-    sr = None
-    SPEECH_RECOGNITION_AVAILABLE = False
+# -----------------------------
+# Transcriber (singleton)
+# -----------------------------
 
-
-class WhisperTranscriber:
+class _Transcriber:
     """
-    Optimized Whisper transcriber for real-time performance
+    Async-friendly wrapper around whisper.cpp Python bindings.
+    - Resamples Discord PCM (48kHz stereo s16) to 16kHz mono float32.
+    - Runs transcription in a thread executor to avoid blocking the event loop.
+    - Tracks simple performance stats for /transcription_stats.
     """
-    
-    def __init__(self, model_size: str = "base"):
-        """
-        Initialize Whisper transcriber with specified model size
-        
-        Args:
-            model_size: Model size for whisper ("tiny", "base", "small", "medium", "large")
-                       "tiny" and "base" are recommended for real-time use
-        """
-        self.model_size = model_size
-        self.model = None
-        self.is_loaded = False
-        self.fallback_recognizer = None
-        
-        # Performance tracking
+    def __init__(self, model_size: Optional[str] = None):
+        self.model_size = (model_size or os.getenv("WHISPER_MODEL") or "tiny.en").strip()
+        self.backend = _BACKEND
+        self.backend_note = _BACKEND_NOTE
+        self._model = None
+        self._model_loaded_path: Optional[str] = None
+        self._lock = asyncio.Lock()
+
+        # perf stats
         self.transcription_count = 0
-        self.total_time = 0.0
-        
-        # Initialize fallback recognizer
-        if SPEECH_RECOGNITION_AVAILABLE:
-            self.fallback_recognizer = sr.Recognizer()
-            logger.info("Initialized fallback Google Speech Recognition")
-    
-    async def load_model(self) -> bool:
+        self._total_time = 0.0
+        self._avg_time = 0.0
+
+    # -------------------------
+    # Public API (matches your bot.py usage)
+    # -------------------------
+    async def transcribe_audio(self, pcm_bytes: bytes, *, language: Optional[str] = "en",
+                               translate: bool = False) -> str:
         """
-        Load Whisper model asynchronously to avoid blocking startup
-        """
-        if not WHISPER_AVAILABLE:
-            logger.warning("Whisper not available, using fallback recognition")
-            return False
-            
-        try:
-            start_time = time.time()
-            logger.info(f"Loading Whisper {self.model_size} model...")
-            
-            # Load model in thread pool to avoid blocking
-            loop = asyncio.get_event_loop()
-            self.model = await loop.run_in_executor(None, whisper.load_model, self.model_size)
-            
-            load_time = time.time() - start_time
-            logger.info(f"Whisper {self.model_size} model loaded in {load_time:.2f}s")
-            
-            self.is_loaded = True
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to load Whisper model: {e}")
-            return False
-    
-    def _prepare_audio_data(self, pcm_bytes: bytes, sample_rate: int = 48000) -> bytes:
-        """
-        Convert raw PCM data to WAV format that whisper can process
-        """
-        audio_io = io.BytesIO()
-        with wave.open(audio_io, "wb") as wav_file:
-            wav_file.setnchannels(2)          # Discord stereo
-            wav_file.setsampwidth(2)          # 16-bit
-            wav_file.setframerate(sample_rate) # Discord sample rate
-            wav_file.writeframes(pcm_bytes)
-        audio_io.seek(0)
-        return audio_io.getvalue()
-    
-    async def _transcribe_with_whisper(self, audio_data: bytes) -> Optional[str]:
-        """
-        Transcribe audio using Whisper model
-        """
-        if not self.model or not WHISPER_AVAILABLE:
-            return None
-            
-        try:
-            start_time = time.time()
-            
-            # Save audio data to temporary file for whisper
-            import tempfile
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
-                temp_file.write(audio_data)
-                temp_path = temp_file.name
-            
-            try:
-                # Transcribe with optimized settings for real-time
-                loop = asyncio.get_event_loop()
-                result = await loop.run_in_executor(
-                    None, 
-                    lambda: self.model.transcribe(
-                        temp_path,
-                        # Optimizations for real-time performance
-                        language="en",              # Skip language detection
-                        task="transcribe",          # Don't translate
-                        temperature=0.0,            # Deterministic output
-                        best_of=1,                  # Single pass
-                        beam_size=1,                # Fastest beam search
-                        patience=1.0,               # Less patience for speed
-                        length_penalty=1.0,         # Standard penalty
-                        suppress_tokens="",         # Don't suppress anything
-                        initial_prompt="",          # No initial prompt
-                        condition_on_previous_text=False,  # Don't use context for speed
-                        fp16=True,                  # Use half precision for speed
-                        compression_ratio_threshold=2.4,
-                        logprob_threshold=-1.0,
-                        no_speech_threshold=0.6,
-                    )
-                )
-                
-                transcription_time = time.time() - start_time
-                
-                # Update performance metrics
-                self.transcription_count += 1
-                self.total_time += transcription_time
-                avg_time = self.total_time / self.transcription_count
-                
-                if transcription_time > 0.1:  # Log slow transcriptions
-                    logger.debug(f"Whisper transcription took {transcription_time:.3f}s (avg: {avg_time:.3f}s)")
-                
-                text = result.get("text", "").strip()
-                return text if text else None
-                
-            finally:
-                # Clean up temporary file
-                try:
-                    Path(temp_path).unlink()
-                except Exception:
-                    pass
-                    
-        except Exception as e:
-            logger.error(f"Whisper transcription error: {e}")
-            return None
-    
-    async def _transcribe_with_fallback(self, audio_data: bytes) -> Optional[str]:
-        """
-        Fallback transcription using Google Speech Recognition
-        """
-        if not self.fallback_recognizer or not SPEECH_RECOGNITION_AVAILABLE:
-            return None
-            
-        try:
-            # Use SpeechRecognition with the WAV data
-            audio_io = io.BytesIO(audio_data)
-            with sr.AudioFile(audio_io) as source:
-                audio = self.fallback_recognizer.record(source)
-            
-            # Run recognition in thread pool
-            loop = asyncio.get_event_loop()
-            text = await loop.run_in_executor(
-                None,
-                self.fallback_recognizer.recognize_google,
-                audio
-            )
-            
-            return text.strip() if text else None
-            
-        except sr.UnknownValueError:
-            logger.debug("Fallback recognition: Could not understand audio")
-            return None
-        except sr.RequestError as e:
-            logger.error(f"Fallback recognition error: {e}")
-            return None
-        except Exception as e:
-            logger.error(f"Fallback transcription error: {e}")
-            return None
-    
-    async def transcribe_audio(self, pcm_bytes: bytes) -> Optional[str]:
-        """
-        Transcribe audio data with automatic fallback
-        
-        Args:
-            pcm_bytes: Raw PCM audio data from Discord
-            
-        Returns:
-            Transcribed text or None if transcription failed
+        Accept raw PCM s16le 48kHz stereo from py-cord WaveSink, convert to 16k mono float32,
+        and run whisper.cpp transcription.
         """
         if not pcm_bytes:
-            return None
-            
-        # Prepare audio data
-        audio_data = self._prepare_audio_data(pcm_bytes)
-        
-        # Try Whisper first (if available and loaded)
-        if self.is_loaded and WHISPER_AVAILABLE:
-            text = await self._transcribe_with_whisper(audio_data)
-            if text:
-                return text
-            logger.debug("Whisper transcription failed, trying fallback")
-        
-        # Fallback to Google Speech Recognition
-        return await self._transcribe_with_fallback(audio_data)
-    
-    def get_performance_stats(self) -> dict:
-        """Get performance statistics"""
-        if self.transcription_count > 0:
-            avg_time = self.total_time / self.transcription_count
-        else:
-            avg_time = 0.0
-            
+            return ""
+
+        # Ensure model is loaded lazily
+        await self._ensure_loaded()
+
+        try:
+            audio = await self._to_float32_mono_16k(pcm_bytes)
+        except Exception as e:
+            # If resampling fails (ffmpeg missing), safe fail
+            return ""
+
+        loop = asyncio.get_running_loop()
+        started = time.perf_counter()
+        try:
+            text = await loop.run_in_executor(
+                None,
+                self._blocking_transcribe,
+                audio,
+                language,
+                translate,
+            )
+        finally:
+            elapsed = time.perf_counter() - started
+            self.transcription_count += 1
+            self._total_time += elapsed
+            self._avg_time = self._total_time / max(1, self.transcription_count)
+
+        return (text or "").strip()
+
+    def get_performance_stats(self) -> Dict[str, Any]:
         return {
+            "backend": self.backend or "none",
+            "backend_note": self.backend_note,
+            "whisper_available": bool(self.backend and self._model is not None),
+            "model_loaded": self._model is not None,
             "model_size": self.model_size,
-            "whisper_available": WHISPER_AVAILABLE,
-            "model_loaded": self.is_loaded,
             "transcription_count": self.transcription_count,
-            "total_time": self.total_time,
-            "average_time": avg_time,
-            "fallback_available": SPEECH_RECOGNITION_AVAILABLE
+            "average_time": round(self._avg_time, 3),
         }
 
+    # -------------------------
+    # Internal
+    # -------------------------
+    async def _ensure_loaded(self):
+        if self._model is not None:
+            return
+        if self.backend is None or _Whisper is None:
+            # No backend installed
+            return
+        async with self._lock:
+            if self._model is not None:
+                return
 
-# Global transcriber instance
-_transcriber_instance: Optional[WhisperTranscriber] = None
+            if self.backend == "whispercpp":
+                # aarnphm/whispercpp supports from_pretrained("tiny.en"|"base.en"|...)
+                self._model = _Whisper.from_pretrained(self.model_size)  # downloads/caches if needed
+                # Optional params (threads/language/translate) are set per-call below
+                self._model_loaded_path = f"pretrained://{self.model_size}"
+            elif self.backend == "whisper_cpp_python":
+                # This backend requires a local ggml model path
+                model_path = os.getenv("WHISPER_CPP_MODEL")
+                if not model_path or not os.path.exists(model_path):
+                    # try a few common fallbacks relative to cwd
+                    guesses = [
+                        f"./models/ggml-{self.model_size.replace('.','-')}.bin",
+                        f"./models/ggml-{self.model_size}.bin",
+                        "./models/ggml-tiny.en.bin",
+                        "./models/ggml-tiny.bin",
+                    ]
+                    for g in guesses:
+                        if os.path.exists(g):
+                            model_path = g
+                            break
+                if not model_path or not os.path.exists(model_path):
+                    # Can't load anything
+                    self._model = None
+                    self._model_loaded_path = None
+                    return
+                self._model = _Whisper(model_path)  # this backend wants a file path
+                self._model_loaded_path = model_path
 
-async def get_transcriber(model_size: str = "base") -> WhisperTranscriber:
-    """
-    Get the global transcriber instance
-    
-    Args:
-        model_size: Whisper model size ("tiny", "base", "small", "medium", "large")
-                   "tiny" = Fastest, least accurate
-                   "base" = Good balance of speed and accuracy (recommended)
-                   "small" = Better accuracy, slower
-    """
-    global _transcriber_instance
-    
-    if _transcriber_instance is None or _transcriber_instance.model_size != model_size:
-        _transcriber_instance = WhisperTranscriber(model_size)
-        await _transcriber_instance.load_model()
-    
-    return _transcriber_instance
+    def _blocking_transcribe(self, audio_f32_mono_16k: np.ndarray,
+                             language: Optional[str],
+                             translate: bool) -> str:
+        if self._model is None:
+            return ""
 
-async def transcribe_audio(pcm_bytes: bytes, model_size: str = "base") -> Optional[str]:
-    """
-    Convenience function for transcribing audio
-    
-    Args:
-        pcm_bytes: Raw PCM audio data from Discord
-        model_size: Whisper model size for optimal performance
-        
-    Returns:
-        Transcribed text or None if failed
-    """
-    transcriber = await get_transcriber(model_size)
-    return await transcriber.transcribe_audio(pcm_bytes)
+        # Backend-specific calls
+        if self.backend == "whispercpp":
+            # Configure params each call
+            try:
+                if language:
+                    self._model.params.with_language(language)
+                self._model.params.with_translate(bool(translate))
+            except Exception:
+                pass
 
-# Performance testing function
-async def benchmark_transcription(model_size: str = "base") -> dict:
-    """
-    Benchmark the transcription performance
-    """
-    transcriber = await get_transcriber(model_size)
-    stats = transcriber.get_performance_stats()
-    
-    print("Whisper Transcription Performance:")
-    print("=" * 50)
-    print(f"Model size: {stats['model_size']}")
-    print(f"Whisper available: {stats['whisper_available']}")
-    print(f"Model loaded: {stats['model_loaded']}")
-    print(f"Fallback available: {stats['fallback_available']}")
-    print(f"Transcriptions: {stats['transcription_count']}")
-    
-    if stats['transcription_count'] > 0:
-        print(f"Average time: {stats['average_time']:.3f}s")
-        print(f"Total time: {stats['total_time']:.3f}s")
-    
-    return stats
+            try:
+                result = self._model.transcribe(audio_f32_mono_16k)
+            except Exception:
+                return ""
+            return self._extract_text(result)
 
-if __name__ == "__main__":
-    # Quick test
-    async def test():
-        print("Testing Whisper integration...")
-        print(f"Whisper available: {WHISPER_AVAILABLE}")
-        print(f"SpeechRecognition fallback: {SPEECH_RECOGNITION_AVAILABLE}")
-        
-        # Test initialization
-        transcriber = await get_transcriber("base")
-        stats = transcriber.get_performance_stats()
-        
-        print("\nInitialization complete:")
-        for key, value in stats.items():
-            print(f"  {key}: {value}")
-    
-    asyncio.run(test())
+        elif self.backend == "whisper_cpp_python":
+            # This backend’s high-level API prefers file paths; write a temp WAV
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp:
+                    self._write_wav_16k_mono_s16(tmp.name, audio_f32_mono_16k)
+                    result = self._model.transcribe(tmp.name)  # type: ignore[attr-defined]
+            except Exception:
+                return ""
+            return self._extract_text(result)
+
+        return ""
+
+    # Result normalization across backends
+    @staticmethod
+    def _extract_text(result: Any) -> str:
+        if isinstance(result, str):
+            return result
+        # common dict/list shapes
+        if isinstance(result, dict):
+            if "text" in result:
+                return str(result["text"])
+            if "segments" in result and isinstance(result["segments"], list):
+                return "".join(seg.get("text", "") for seg in result["segments"])
+        if isinstance(result, (list, tuple)):
+            parts = []
+            for seg in result:
+                if isinstance(seg, dict) and "text" in seg:
+                    parts.append(seg["text"])
+            if parts:
+                return "".join(parts)
+        # last resort
+        try:
+            return str(getattr(result, "text", "")) or ""
+        except Exception:
+            return ""
+
+    # Convert raw PCM s16le 48kHz stereo to float32 mono @ 16kHz
+    async def _to_float32_mono_16k(self, pcm_bytes_48k_stereo: bytes) -> np.ndarray:
+        """Uses ffmpeg via subprocess for high-quality resampling without extra Python deps."""
+        if not shutil.which("ffmpeg"):
+            raise RuntimeError("ffmpeg not installed")
+
+        # Feed raw PCM in; receive raw PCM out (16k mono s16le)
+        # Input:  s16le, 48k, 2ch  (Discord voice receive format)
+        # Output: s16le, 16k, 1ch
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg",
+            "-nostdin",
+            "-hide_banner", "-loglevel", "error",
+            "-f", "s16le", "-ar", "48000", "-ac", "2", "-i", "pipe:0",
+            "-f", "s16le", "-ar", "16000", "-ac", "1", "pipe:1",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, err = await proc.communicate(input=pcm_bytes_48k_stereo)
+        if proc.returncode != 0:
+            raise RuntimeError(f"ffmpeg resample failed: {err.decode(errors='ignore')}")
+        # s16 -> f32 mono in [-1,1]
+        audio_i16 = np.frombuffer(out, dtype=np.int16)
+        audio_f32 = (audio_i16.astype(np.float32) / 32768.0).flatten()
+        return audio_f32
+
+    @staticmethod
+    def _write_wav_16k_mono_s16(path: str, audio_f32_mono_16k: np.ndarray):
+        """Write a small WAV if a backend insists on files (whisper-cpp-python)."""
+        import wave
+        # Clip to int16
+        pcm = np.clip(audio_f32_mono_16k * 32768.0, -32768, 32767).astype(np.int16).tobytes()
+        with wave.open(path, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            wf.writeframes(pcm)
+
+
+# -----------------------------
+# Module-level helpers to match your imports in bot.py
+# -----------------------------
+
+_GLOBAL: Optional[_Transcriber] = None
+
+async def get_transcriber(model_size: Optional[str] = None) -> _Transcriber:
+    global _GLOBAL
+    if _GLOBAL is None:
+        _GLOBAL = _Transcriber(model_size)
+    return _GLOBAL
+
+async def transcribe_audio(pcm_bytes: bytes, model_size: Optional[str] = None,
+                           *, language: Optional[str] = "en",
+                           translate: bool = False) -> str:
+    tr = await get_transcriber(model_size)
+    return await tr.transcribe_audio(pcm_bytes, language=language, translate=translate)
