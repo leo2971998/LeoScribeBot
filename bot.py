@@ -18,7 +18,7 @@ import speech_recognition as sr
 # Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("LeoScribeBot")
-# Uncomment for very chatty logs:
+# For extra verbosity:
 # logging.getLogger("discord").setLevel(logging.DEBUG)
 
 # Local modules
@@ -36,6 +36,9 @@ async def _safe_defer(interaction: discord.Interaction):
         except Exception:
             pass
 
+# ─────────────────────────────
+# Audio buffering per user
+# ─────────────────────────────
 class UserAudioBuffer:
     def __init__(self, user_id: int):
         self.user_id = user_id
@@ -59,6 +62,7 @@ class UserAudioBuffer:
 
 # ─────────────────────────────
 # Pycord WaveSink for recording
+# Pycord calls: sink.write(pcm_bytes: bytes, user_id: int)
 # ─────────────────────────────
 class TranscriptionSink(discord.sinks.WaveSink):
     def __init__(self, bot: "LeoScribeBot", channel: discord.abc.Messageable):
@@ -69,7 +73,6 @@ class TranscriptionSink(discord.sinks.WaveSink):
         self.recognizer = sr.Recognizer()
         self.processing = True
 
-    # Pycord calls write(pcm_bytes: bytes, user_id: int)
     def write(self, pcm_bytes: bytes, user_id: int):
         if not self.processing:
             return
@@ -81,7 +84,7 @@ class TranscriptionSink(discord.sinks.WaveSink):
         if not audio_data:
             return
         try:
-            # Wrap PCM in WAV container so SpeechRecognition can read it
+            # Wrap PCM in WAV for SpeechRecognition
             audio_io = io.BytesIO()
             with wave.open(audio_io, "wb") as wav_file:
                 wav_file.setnchannels(2)      # stereo
@@ -95,7 +98,7 @@ class TranscriptionSink(discord.sinks.WaveSink):
             text = self.recognizer.recognize_google(audio)
 
             if text.strip():
-                # Best effort to resolve display name
+                # Resolve username best-effort
                 username = f"User {user_id}"
                 try:
                     guild = getattr(self.channel, "guild", None)
@@ -176,6 +179,14 @@ class TranscriptionView(discord.ui.View):
         await _safe_defer(interaction)
         gid = interaction.guild.id if interaction.guild else self.guild_id
 
+        # Prevent double-starts
+        if gid in self.bot.active_sessions:
+            try:
+                await interaction.followup.send("⚠️ Already recording in this server. Click **Stop** first.", ephemeral=True)
+            except Exception:
+                pass
+            return
+
         if not interaction.user.voice:
             try:
                 await interaction.followup.send("❌ You need to be in a voice channel to start transcription!", ephemeral=True)
@@ -208,8 +219,24 @@ class TranscriptionView(discord.ui.View):
             sink = TranscriptionSink(self.bot, transcript_channel)
             self.bot.active_sessions[gid] = sink
 
-            def _on_finish(_sink_obj, *args, **kwargs):
+            # ASYNC finish callback required by py-cord
+            async def _on_finish(_sink_obj, *args, **kwargs):
                 logger.info("Recording finished")
+                try:
+                    # If this is still the active sink, clean it and update UI
+                    if self.bot.active_sessions.get(gid) is _sink_obj:
+                        _sink_obj.cleanup()
+                        self.bot.active_sessions.pop(gid, None)
+                        new_view = TranscriptionView(self.bot, gid)
+                        try:
+                            await interaction.message.edit(
+                                embed=new_view.get_status_embed("⏹️ Recording Stopped", "Session ended"),
+                                view=new_view,
+                            )
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
 
             voice_client.start_recording(sink, _on_finish)
 
@@ -256,18 +283,21 @@ class TranscriptionView(discord.ui.View):
         gid = interaction.guild.id if interaction.guild else self.guild_id
 
         try:
-            voice_client = interaction.guild.voice_client
+            voice_client = interaction.guild.voice_client if interaction.guild else None
             if voice_client:
                 try:
                     voice_client.stop_recording()
                 except Exception:
                     pass
-                await voice_client.disconnect()
+                try:
+                    await voice_client.disconnect()
+                except Exception:
+                    pass
 
             if gid in self.bot.active_sessions:
                 sink: TranscriptionSink = self.bot.active_sessions[gid]
                 sink.cleanup()
-                del self.bot.active_sessions[gid]
+                self.bot.active_sessions.pop(gid, None)
 
             new_view = TranscriptionView(self.bot, gid)
             await interaction.message.edit(
@@ -389,7 +419,7 @@ class LeoScribeBot(discord.Bot):
         ensure_opus_loaded()
 
     async def setup_hook(self):
-        # Register a generic persistent view so custom_id callbacks are active after restart
+        # Register a generic persistent view so custom_id callbacks work after restart
         self.add_view(TranscriptionView(self, 0))
         await self.sync_commands()
         logger.info("Slash commands synced!")
