@@ -3,7 +3,7 @@ module.exports = {
     name: 'leoscribebot',
     script: 'bot.py',
     interpreter: 'python3',
-    cwd: '/path/to/your/bot',
+    cwd: '/home/leo29798/LeoScribeBot',
     instances: 1,
     autorestart: true,
     watch: false,
