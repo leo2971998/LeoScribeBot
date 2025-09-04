@@ -25,6 +25,7 @@ logger = logging.getLogger("LeoScribeBot")
 from storage import GuildStore
 from voice_utils import ensure_opus_loaded, connect_voice_fresh, VoiceConnectError
 from text_clean import clean_transcript  # <<— ADD: transcript cleaner
+from text_corrector import correct_transcript  # <<— ADD: real-time corrector
 
 
 def utcnow():
@@ -100,9 +101,13 @@ class TranscriptionSink(discord.sinks.WaveSink):
                 audio = self.recognizer.record(source)
             text = self.recognizer.recognize_google(audio)
 
-            # <<— ADD: clean ONLY the content, not the username
+            # Two-stage text processing for optimal results:
+            # 1. Real-time spaCy correction (optimized for Intel N95, <50ms)
+            corrected = await correct_transcript(text)
+            
+            # 2. Traditional text cleaning for final polish
             polished = clean_transcript(
-                text,
+                corrected,
                 collapse_spelled=True,
                 enforce_sentence_case=True,
                 normalize_punct=True,
@@ -463,6 +468,18 @@ class LeoScribeBot(discord.Bot):
         ensure_opus_loaded()
 
     async def setup_hook(self):
+        # Initialize text corrector for real-time performance
+        try:
+            from text_corrector import get_corrector
+            logger.info("Initializing real-time text corrector...")
+            start_time = time.time()
+            await get_corrector()  # Pre-load the corrector and spaCy model
+            load_time = time.time() - start_time
+            logger.info(f"Text corrector initialized in {load_time:.2f}s")
+        except Exception as e:
+            logger.warning(f"Text corrector initialization failed: {e}")
+            logger.info("Falling back to basic text cleaning only")
+        
         # Register a generic persistent view so custom_id callbacks work after restart
         self.add_view(TranscriptionView(self, 0))
         await self.sync_commands()
