@@ -1,127 +1,182 @@
 #!/bin/bash
-# Enhanced setup script for LeoScribeBot with three-layer text correction system
+# Enhanced setup script for LeoScribeBot (whisper.cpp + 3-layer text correction)
 
-echo "🚀 Setting up LeoScribeBot with three-layer text correction..."
+set -euo pipefail
 
-# --- Configuration: Colors for output ---
+# ---------- Colors ----------
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# --- Helper Functions for logging ---
-print_status() {
-    echo -e "${BLUE}[INFO]${NC} $1"
-}
-print_success() {
-    echo -e "${GREEN}[SUCCESS]${NC} $1"
-}
-print_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
-}
+print_status()  { echo -e "${BLUE}[INFO]${NC} $1"; }
+print_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
+print_error()   { echo -e "${RED}[ERROR]${NC} $1"; }
 
-# --- Fix for Caddy GPG Key ---
-print_status "Checking for and adding missing GPG keys..."
-curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable.gpg
-print_success "Caddy GPG key is up to date."
+# ---------- Sanity checks ----------
+if ! command -v apt >/dev/null 2>&1; then
+  print_error "This script targets Debian/Ubuntu (apt). For other distros, install equivalent packages manually."
+  exit 1
+fi
 
-# --- System Updates ---
-print_status "Updating system packages..."
-sudo apt update && sudo apt upgrade -y
+if ! command -v curl >/dev/null 2>&1; then
+  print_status "Installing curl..."
+  sudo apt update && sudo apt install -y curl
+fi
 
-# --- System Dependency Installation ---
-print_status "Installing system dependencies for audio and Python..."
+# ---------- (Optional) Caddy GPG key fix ----------
+print_status "Checking/adding Caddy GPG key…"
+curl -fsSL 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+  | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable.gpg || true
+print_success "Caddy GPG key step complete."
+
+# ---------- System updates ----------
+print_status "Updating system packages…"
+sudo apt update
+sudo apt -y upgrade
+
+# ---------- System dependencies ----------
+print_status "Installing base system dependencies…"
 sudo apt install -y \
-    python3 \
-    python3-pip \
-    python3-venv \
-    python3-dev \
-    portaudio19-dev \
-    ffmpeg \
-    libffi-dev \
-    libnacl-dev \
-    build-essential \
-    git
+  python3 python3-pip python3-venv python3-dev \
+  build-essential git pkg-config \
+  portaudio19-dev \
+  ffmpeg \
+  libffi-dev \
+  libsodium-dev \
+  libopus0
 
-# --- Robust Python Version Check ---
-print_status "Checking Python version..."
+# (Compatibility fallback: some environments use libnacl-dev; harmless if already satisfied)
+sudo apt install -y libnacl-dev || true
+
+print_success "System dependencies installed."
+
+# ---------- Python version ----------
+print_status "Checking Python version…"
 PYTHON_VERSION=$(python3 -c 'import sys; print(".".join(map(str, sys.version_info[:2])))')
-
 if dpkg --compare-versions "$PYTHON_VERSION" "lt" "3.8"; then
-    print_error "Python 3.8 or higher is required. You have version $PYTHON_VERSION."
-    exit 1
+  print_error "Python 3.8+ required. Detected $PYTHON_VERSION."
+  exit 1
 else
-    print_success "Python version $PYTHON_VERSION is compatible."
+  print_success "Python $PYTHON_VERSION is compatible."
 fi
 
-# --- Virtual Environment Setup (Nuke and Rebuild) ---
-print_status "Setting up Python virtual environment..."
+# ---------- Virtual environment (clean rebuild) ----------
+print_status "Creating virtual environment…"
 if [ -d "venv" ]; then
-    print_status "Removing old virtual environment for a clean installation..."
-    rm -rf venv
+  print_status "Removing existing venv for a clean install…"
+  rm -rf venv
 fi
-
 python3 -m venv venv
-print_success "Virtual environment created."
-
 source venv/bin/activate
-print_success "Virtual environment activated."
+print_success "Virtual environment ready."
 
-# --- Python Dependency Installation ---
-print_status "Upgrading pip..."
-pip install --upgrade pip
+# ---------- Python deps ----------
+print_status "Upgrading pip, wheel, setuptools…"
+pip install --upgrade pip wheel setuptools
 
-print_status "Installing Python dependencies from requirements.txt..."
+print_status "Installing Python dependencies from requirements.txt…"
 pip install -r requirements.txt
 
-print_success "All Python dependencies are installed."
+# If whispercpp wasn't included in requirements, try to install it (fallback to whisper-cpp-python)
+python - <<'PY'
+import importlib, sys, subprocess
+def has(mod):
+    try:
+        importlib.import_module(mod)
+        return True
+    except Exception:
+        return False
 
-# --- spaCy Model Download ---
-print_status "Downloading spaCy English model (en_core_web_sm)..."
+if not has("whispercpp") and not has("whisper_cpp_python"):
+    print("[INFO] Neither 'whispercpp' nor 'whisper-cpp-python' is installed. Attempting to install 'whispercpp'…")
+    code = subprocess.call([sys.executable, "-m", "pip", "install", "whispercpp"])
+    if code != 0:
+        print("[WARN] 'whispercpp' install failed, trying 'whisper-cpp-python'…")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "whisper-cpp-python"])
+PY
+
+print_success "Python packages installed."
+
+# ---------- spaCy model ----------
+print_status "Downloading spaCy model (en_core_web_sm)…"
 python -m spacy download en_core_web_sm
-print_success "spaCy model downloaded."
+print_success "spaCy model installed."
 
-# --- Install thefuzz with speedup for Intel N95 optimization ---
-print_status "Installing thefuzz with C-extension speedup for Intel N95..."
-pip install "thefuzz[speedup]"
-print_success "thefuzz with speedup installed."
+# ---------- Ensure .env has essential keys ----------
+print_status "Ensuring .env exists with required keys…"
+touch .env
 
-# Deactivate for a clean state before finishing
-deactivate
+ensure_env () {
+  local KEY="$1"
+  local DEFAULT_VAL="$2"
+  if ! grep -qE "^${KEY}=.*" .env; then
+    echo "${KEY}=${DEFAULT_VAL}" >> .env
+    print_status "Added ${KEY} to .env"
+  fi
+}
 
-# --- Final Instructions ---
+# Set defaults if missing (your token + tiny.en for speed on mini-PC)
+ensure_env "DISCORD_TOKEN" "your_token_here"
+ensure_env "WHISPER_MODEL" "tiny.en"
+
+print_success ".env is configured (DISCORD_TOKEN, WHISPER_MODEL)."
+echo -e "${YELLOW}Current .env:${NC}"
+grep -E "^(DISCORD_TOKEN|WHISPER_MODEL)=" .env || true
+echo
+
+# ---------- Verify ffmpeg ----------
+print_status "Verifying ffmpeg availability…"
+ffmpeg -hide_banner -loglevel error -version >/dev/null 2>&1 && \
+  print_success "ffmpeg is available." || {
+    print_error "ffmpeg not found on PATH after install."
+    exit 1
+}
+
+# ---------- Quick backend self-test ----------
+print_status "Running quick whisper backend self-test…"
+python - <<'PY'
+import asyncio, os
+try:
+    from whisper_utils import get_transcriber
+except Exception as e:
+    print("[ERROR] Could not import whisper_utils:", e)
+    raise SystemExit(1)
+
+async def main():
+    tr = await get_transcriber()  # uses WHISPER_MODEL if available
+    stats = tr.get_performance_stats()
+    print("[INFO] Backend    :", stats.get("backend"))
+    print("[INFO] Model      :", stats.get("model_size"))
+    print("[INFO] Model ready:", stats.get("model_loaded"))
+    print("[INFO] Available  :", stats.get("whisper_available"))
+
+asyncio.run(main())
+PY
+print_success "Backend self-test completed."
+
+# ---------- Deactivate ----------
+deactivate || true
+
+# ---------- Final notes ----------
+echo
 print_success "Setup complete! 🎉"
-echo ""
-echo -e "${YELLOW}🔧 Three-Layer Text Correction System:${NC}"
-echo "   • Layer 1: Basic transcription (Google Speech Recognition)"
-echo "   • Layer 2: Phrase corrections using spaCy Matcher"
-echo "   • Layer 3: Fuzzy word matching using thefuzz"
-echo ""
-echo -e "${YELLOW}🎮 Gaming Term Support:${NC}"
-echo "   • Stormlight Archive terms (Surgebinding, Investiture, etc.)"
-echo "   • D&D terms (classes, monsters, spells, locations)"
-echo "   • Baldur's Gate 3 character names"
-echo ""
-echo -e "${YELLOW}⚡ Intel N95 Optimizations:${NC}"
-echo "   • The bot is optimized for CPU usage, averaging <50ms for corrections."
-echo "   • Total memory usage should remain low (~100-150MB)."
-echo "   • All processing is done offline on your machine."
-echo "   • C-extension speedup for fuzzy matching."
-echo ""
-echo -e "${YELLOW}📋 Next Steps:${NC}"
-echo "   1. Create your .env file with your Discord token:"
-echo "      echo 'DISCORD_TOKEN=your_token_here' > .env"
-echo ""
-echo "   2. Test the correction system:"
-echo "      python3 text_corrector.py"
-echo ""
-echo "   3. Start the bot using PM2 for production deployment:"
-echo "      ./start.sh"
-echo ""
-echo "   4. To view logs:"
-echo "      pm2 logs leoscribebot"
-echo ""
-echo "   5. To stop the bot:"
-echo "      ./stop.sh"
-
+echo -e "${YELLOW}Speech stack:${NC}"
+echo "  • Primary: whisper.cpp (offline, CPU-friendly)."
+echo "  • Fallback: Google Speech Recognition (only if whisper.cpp not available)."
+echo
+echo -e "${YELLOW}Three-layer text correction:${NC}"
+echo "  1) Transcription (whisper.cpp @ 16 kHz mono)"
+echo "  2) Real-time spaCy phrase corrections"
+echo "  3) Fuzzy word matching via thefuzz"
+echo
+echo -e "${YELLOW}Intel N95 tips:${NC}"
+echo "  • WHISPER_MODEL=tiny.en (fast)  — change to base/base.en for more accuracy."
+echo "  • Make sure voice receive uses 48kHz PCM; bot resamples to 16kHz mono."
+echo
+echo -e "${YELLOW}Next steps:${NC}"
+echo "  1) Put your real token into .env (DISCORD_TOKEN=...)"
+echo "  2) Start the bot: ./start.sh    (or: source venv/bin/activate && python bot.py)"
+echo "  3) In Discord: /setup → click Start Recording"
+echo "  4) Check /transcription_stats to confirm backend = whispercpp, model = tiny.en"
