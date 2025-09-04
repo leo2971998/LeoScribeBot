@@ -2,7 +2,7 @@ module.exports = {
   apps: [{
     name: 'leoscribebot',
     script: 'bot.py',
-    interpreter: 'python3',
+    interpreter: '/home/leo29798/LeoScribeBot/venv/bin/python3',
     cwd: '/home/leo29798/LeoScribeBot',
     instances: 1,
     autorestart: true,
