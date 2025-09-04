@@ -13,19 +13,19 @@ from typing import Dict
 from contextlib import suppress
 
 import discord
-from discord.ext import tasks, commands
+from discord.ext import tasks
 import speech_recognition as sr
-DEBUG_GUILD_IDS = [
-    884793798679482458,  # Study
-    1336548070187335703, # Happy Home
-    731364699526004747,  # Lớp học thầy Tùng (works)
-]
+
+# ─────────────────────────────
 # Logging
+# ─────────────────────────────
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("LeoScribeBot")
 # logging.getLogger("discord").setLevel(logging.DEBUG)  # uncomment for verbose
 
+# ─────────────────────────────
 # Local modules
+# ─────────────────────────────
 from storage import GuildStore
 from voice_utils import ensure_opus_loaded, connect_voice_fresh, VoiceConnectError
 
@@ -39,6 +39,22 @@ async def _safe_defer(interaction: discord.Interaction):
     if not interaction.response.is_done():
         with suppress(Exception):
             await interaction.response.defer()
+
+
+# Regions your host tends to reach reliably; adjust to your environment
+RTC_REGION_CANDIDATES = ["hongkong", "us-south", "singapore", "us-central"]
+
+
+async def _try_set_region(vc_channel: discord.VoiceChannel, region: str | None) -> bool:
+    """Set rtc_region on a voice channel. region=None → Automatic. Returns True on success."""
+    try:
+        await vc_channel.edit(rtc_region=region)
+        return True
+    except discord.Forbidden:
+        logger.warning("Missing Manage Channel permission to change RTC region.")
+    except Exception as e:
+        logger.warning(f"Failed to edit rtc_region to {region!r}: {e}")
+    return False
 
 
 # ─────────────────────────────
@@ -215,7 +231,8 @@ class TranscriptionView(discord.ui.View):
             with suppress(Exception):
                 await existing_vc.move_to(voice_channel)
 
-        # ---- Voice connect with 4006 retry handling ----
+        # ---- Voice connect with 4006 retry + RTC region fallbacks ----
+        voice_client = None
         try:
             voice_client = await connect_voice_fresh(interaction.guild, voice_channel)
             await asyncio.sleep(0.5)
@@ -223,28 +240,60 @@ class TranscriptionView(discord.ui.View):
         except discord.errors.ConnectionClosed as e:
             code = getattr(e, "code", None)
             if code == 4006:
-                logger.warning("Voice WS 4006 on first attempt; hard-resetting and retrying once…")
+                logger.warning("Voice WS 4006 on first attempt; trying RTC region fallbacks…")
+
+                # 1) Clear Discord-side voice state
                 with suppress(Exception):
                     await interaction.guild.change_voice_state(channel=None, self_mute=True, self_deaf=True)
-                await asyncio.sleep(2.5)
-                try:
-                    voice_client = await connect_voice_fresh(interaction.guild, voice_channel)
-                    await asyncio.sleep(0.5)
-                except discord.errors.ConnectionClosed as e2:
-                    logger.error(f"Voice WS {getattr(e2,'code',None)} again on retry; giving up cleanly.")
+                await asyncio.sleep(2.0)
+
+                tried = []
+
+                # 2) Try Automatic
+                if await _try_set_region(voice_channel, None):
+                    tried.append("auto")
+                    try:
+                        voice_client = await connect_voice_fresh(interaction.guild, voice_channel)
+                        await asyncio.sleep(0.5)
+                        logger.info("Connected after setting RTC region = Automatic")
+                    except discord.errors.ConnectionClosed:
+                        voice_client = None
+
+                # 3) Try candidate list until one works
+                if not (voice_client and voice_client.is_connected()):
+                    for region in RTC_REGION_CANDIDATES:
+                        tried.append(region)
+                        if not await _try_set_region(voice_channel, region):
+                            continue
+                        await asyncio.sleep(1.0)
+                        try:
+                            voice_client = await connect_voice_fresh(interaction.guild, voice_channel)
+                            await asyncio.sleep(0.5)
+                            if voice_client.is_connected():
+                                logger.info(f"Connected after setting RTC region = {region}")
+                                break
+                        except discord.errors.ConnectionClosed as e2:
+                            logger.warning(f"Still failing on rtc_region={region}: WS {getattr(e2,'code',None)}")
+                            voice_client = None
+                            continue
+
+                # 4) If still not connected → show actionable tip
+                if not (voice_client and voice_client.is_connected()):
                     new_view = TranscriptionView(self.bot, gid)
                     await interaction.message.edit(
                         embed=new_view.get_status_embed(
                             "❌ Error",
-                            "Voice gateway invalid session (4006) twice.\n"
-                            "Tip: Toggle the voice channel’s **RTC Region** off/Automatic, or recreate the channel."
+                            "Voice gateway invalid session (4006).\n"
+                            f"Tried RTC regions: {', '.join(tried)}.\n"
+                            "• Set the voice channel’s **Region Override** to a working region (e.g., Hong Kong / US South)\n"
+                            "• Or create a new voice channel and try again."
                         ),
                         view=new_view,
                     )
                     with suppress(Exception):
                         await interaction.followup.send(
-                            "❌ Voice gateway invalid session (4006) twice. "
-                            "Try toggling the channel **RTC Region** or recreating the voice channel.",
+                            "❌ Still getting 4006 after trying region fallbacks. "
+                            "Please pin the channel to a known-good region or create a new channel.",
                             ephemeral=True,
                         )
                     return
@@ -509,12 +558,11 @@ class LeoScribeBot(discord.Bot):
 # Slash Commands
 # ─────────────────────────────
 bot = LeoScribeBot()
-@bot.slash_command(
-    name="setup",
-    description="Create a dedicated channel with interactive controls",
-    guild_ids=DEBUG_GUILD_IDS
-)
+
+
+@bot.slash_command(name="setup", description="Create a dedicated channel with interactive controls")
 async def setup_command(ctx: discord.ApplicationContext):
+    """Create (or reuse) a transcription channel and post the control panel."""
     if not ctx.user.guild_permissions.manage_channels:
         await ctx.respond("❌ You need 'Manage Channels' permission to use this command.", ephemeral=True)
         return
@@ -568,12 +616,10 @@ async def setup_command(ctx: discord.ApplicationContext):
         logger.error(f"Error creating channel: {e}")
         await ctx.respond("❌ An error occurred while creating the channel.", ephemeral=True)
 
-@bot.slash_command(
-    name="voice_reset",
-    description="Force-clear the bot's voice session for this server.",
-    guild_ids=DEBUG_GUILD_IDS
-)
+
+@bot.slash_command(name="voice_reset", description="Force-clear the bot's voice session for this server.")
 async def voice_reset(ctx: discord.ApplicationContext):
+    """Manual reset to clear stubborn 4006/invalid-session issues."""
     await ctx.defer(ephemeral=True)
 
     gid = ctx.guild.id
@@ -581,35 +627,60 @@ async def voice_reset(ctx: discord.ApplicationContext):
     # Stop any active recording session
     sink = bot.active_sessions.get(gid)
     if sink:
-        try:
+        with suppress(Exception):
             sink.cleanup()
-        except Exception:
-            pass
         bot.active_sessions.pop(gid, None)
 
     # Disconnect voice if connected
     vc = ctx.guild.voice_client
     if vc:
-        try:
+        with suppress(Exception):
             if hasattr(vc, "stop_recording"):
                 vc.stop_recording()
-        except Exception:
-            pass
-        try:
+        with suppress(Exception):
             await vc.disconnect(force=True)
-        except Exception:
-            pass
 
     # Clear voice state on Discord's side
-    try:
+    with suppress(Exception):
         await ctx.guild.change_voice_state(channel=None, self_mute=True, self_deaf=True)
-    except Exception:
-        pass
 
+    # Give Discord time to drop the session fully
     await asyncio.sleep(2.5)
+
     await ctx.respond("✅ Voice state cleared. Try **Start Recording** again in your voice channel.", ephemeral=True)
 
+
+@bot.slash_command(name="rtc_region", description="Set or clear the voice channel's Region Override")
+async def rtc_region(ctx: discord.ApplicationContext, region: str):
+    """
+    Use 'auto' to clear override, or a region name like:
+    hongkong, singapore, us-south, us-central, us-east, brazil, sydney, etc.
+    """
+    if not ctx.user.guild_permissions.manage_channels:
+        await ctx.respond("❌ You need 'Manage Channels' to use this.", ephemeral=True)
+        return
+
+    if not ctx.author.voice or ctx.author.voice.channel is None:
+        await ctx.respond("Join the voice channel you want to change first.", ephemeral=True)
+        return
+
+    vc_channel = ctx.author.voice.channel
+    value = None if region.lower() in ("auto", "automatic", "none") else region.lower()
+
+    ok = await _try_set_region(vc_channel, value)
+    if not ok:
+        await ctx.respond("I couldn't change the channel region (missing permission?).", ephemeral=True)
+        return
+
+    if value is None:
+        await ctx.respond(f"✅ Region Override cleared for **{vc_channel.name}** (Automatic).", ephemeral=True)
+    else:
+        await ctx.respond(f"✅ Region Override set to **{value}** for **{vc_channel.name}**.", ephemeral=True)
+
+
+# ─────────────────────────────
 # Entrypoint
+# ─────────────────────────────
 if __name__ == "__main__":
     from dotenv import load_dotenv
     load_dotenv()
