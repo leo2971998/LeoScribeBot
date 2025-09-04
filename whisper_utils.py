@@ -9,29 +9,29 @@ import os
 import time
 import shutil
 import tempfile
-import subprocess
 from typing import Optional, Dict, Any
 
 import numpy as np
 
 # -----------------------------
-# Backend detection (prefer whispercpp)
+# Backend detection (prefer whisper-cpp-python)
 # -----------------------------
-_BACKEND = None          # "whispercpp" | "whisper_cpp_python" | None
+_BACKEND = None          # "whisper_cpp_python" | "whispercpp" | None
 _Whisper = None          # bound class/type
 _BACKEND_NOTE = ""
 
+# Prefer the binding you installed: whisper-cpp-python
 try:
-    # aarnphm/whispercpp: pip install whispercpp ; from whispercpp import Whisper
-    from whispercpp import Whisper as _Whisper  # type: ignore
-    _BACKEND = "whispercpp"
-    _BACKEND_NOTE = "using whispercpp (Pybind11) backend"
+    # pip install whisper-cpp-python ; from whisper_cpp_python import Whisper
+    from whisper_cpp_python import Whisper as _Whisper  # type: ignore
+    _BACKEND = "whisper_cpp_python"
+    _BACKEND_NOTE = "using whisper-cpp-python backend"
 except Exception:
     try:
-        # pip install whisper-cpp-python ; from whisper_cpp_python import Whisper
-        from whisper_cpp_python import Whisper as _Whisper  # type: ignore
-        _BACKEND = "whisper_cpp_python"
-        _BACKEND_NOTE = "using whisper-cpp-python backend"
+        # aarnphm/whispercpp: pip install whispercpp ; from whispercpp import Whisper
+        from whispercpp import Whisper as _Whisper  # type: ignore
+        _BACKEND = "whispercpp"
+        _BACKEND_NOTE = "using whispercpp (Pybind11) backend"
     except Exception:
         _BACKEND = None
         _Whisper = None
@@ -44,7 +44,7 @@ except Exception:
 class _Transcriber:
     """
     Async-friendly wrapper around whisper.cpp Python bindings.
-    - Resamples Discord PCM (48kHz stereo s16) to 16kHz mono float32.
+    - Resamples Discord PCM (48 kHz stereo s16) to 16 kHz mono float32.
     - Runs transcription in a thread executor to avoid blocking the event loop.
     - Tracks simple performance stats for /transcription_stats.
     """
@@ -62,7 +62,7 @@ class _Transcriber:
         self._avg_time = 0.0
 
     # -------------------------
-    # Public API (matches your bot.py usage)
+    # Public API (used by bot.py)
     # -------------------------
     async def transcribe_audio(self, pcm_bytes: bytes, *, language: Optional[str] = "en",
                                translate: bool = False) -> str:
@@ -76,9 +76,13 @@ class _Transcriber:
         # Ensure model is loaded lazily
         await self._ensure_loaded()
 
+        # If no backend/model, return empty so bot falls back to SpeechRecognition
+        if self._model is None:
+            return ""
+
         try:
             audio = await self._to_float32_mono_16k(pcm_bytes)
-        except Exception as e:
+        except Exception:
             # If resampling fails (ffmpeg missing), safe fail
             return ""
 
@@ -118,7 +122,6 @@ class _Transcriber:
         if self._model is not None:
             return
         if self.backend is None or _Whisper is None:
-            # No backend installed
             return
         async with self._lock:
             if self._model is not None:
@@ -127,8 +130,8 @@ class _Transcriber:
             if self.backend == "whispercpp":
                 # aarnphm/whispercpp supports from_pretrained("tiny.en"|"base.en"|...)
                 self._model = _Whisper.from_pretrained(self.model_size)  # downloads/caches if needed
-                # Optional params (threads/language/translate) are set per-call below
                 self._model_loaded_path = f"pretrained://{self.model_size}"
+
             elif self.backend == "whisper_cpp_python":
                 # This backend requires a local ggml model path
                 model_path = os.getenv("WHISPER_CPP_MODEL")
@@ -149,7 +152,8 @@ class _Transcriber:
                     self._model = None
                     self._model_loaded_path = None
                     return
-                self._model = _Whisper(model_path)  # this backend wants a file path
+
+                self._model = _Whisper(model_path)  # whisper-cpp-python expects a file path
                 self._model_loaded_path = model_path
 
     def _blocking_transcribe(self, audio_f32_mono_16k: np.ndarray,
@@ -160,7 +164,7 @@ class _Transcriber:
 
         # Backend-specific calls
         if self.backend == "whispercpp":
-            # Configure params each call
+            # Configure params each call where available
             try:
                 if language:
                     self._model.params.with_language(language)
@@ -175,7 +179,7 @@ class _Transcriber:
             return self._extract_text(result)
 
         elif self.backend == "whisper_cpp_python":
-            # This backend’s high-level API prefers file paths; write a temp WAV
+            # This backend prefers file paths; write a temp WAV
             try:
                 with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp:
                     self._write_wav_16k_mono_s16(tmp.name, audio_f32_mono_16k)
