@@ -103,11 +103,12 @@ class TranscriptionSink(discord.sinks.WaveSink):
             # <<— ADD: clean ONLY the content, not the username
             polished = clean_transcript(
                 text,
-                collapse_spelled=True,      # join D i a d e m → Diadem
-                enforce_sentence_case=True, # sentence casing
-                normalize_punct=True,       # em-dashes, ellipses, spacing, quotes
-                glossary=None,              # or e.g. ["Diadem", "Vurndharth", "Saphryn"]
-                protected_spelled=None      # add terms you DO NOT want joined
+                collapse_spelled=True,
+                enforce_sentence_case=True,
+                normalize_punct=True,
+                glossary=None,
+                protected_spelled=None,
+                smart_quotes=True,   # ← enable smartypants (curly quotes, em dashes, ellipses)
             )
 
             if polished.strip():
