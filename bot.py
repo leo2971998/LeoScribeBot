@@ -26,6 +26,7 @@ from storage import GuildStore
 from voice_utils import ensure_opus_loaded, connect_voice_fresh, VoiceConnectError
 from text_clean import clean_transcript  # <<— ADD: transcript cleaner
 from text_corrector import correct_transcript  # <<— ADD: real-time corrector
+from whisper_utils import transcribe_audio  # <<— ADD: optimized whisper transcription
 
 
 def utcnow():
@@ -88,18 +89,22 @@ class TranscriptionSink(discord.sinks.WaveSink):
         if not audio_data:
             return
         try:
-            # Wrap raw PCM in WAV header for SpeechRecognition
-            audio_io = io.BytesIO()
-            with wave.open(audio_io, "wb") as wav_file:
-                wav_file.setnchannels(2)      # stereo
-                wav_file.setsampwidth(2)      # 16-bit
-                wav_file.setframerate(48000)  # Discord sample rate
-                wav_file.writeframes(audio_data)
-            audio_io.seek(0)
+            # Use optimized Whisper transcription with fallback to Google Speech Recognition
+            text = await transcribe_audio(audio_data, model_size="base")  # "base" for good speed/accuracy balance
+            
+            if not text:  # If Whisper failed, try the original method as ultimate fallback
+                # Wrap raw PCM in WAV header for SpeechRecognition
+                audio_io = io.BytesIO()
+                with wave.open(audio_io, "wb") as wav_file:
+                    wav_file.setnchannels(2)      # stereo
+                    wav_file.setsampwidth(2)      # 16-bit
+                    wav_file.setframerate(48000)  # Discord sample rate
+                    wav_file.writeframes(audio_data)
+                audio_io.seek(0)
 
-            with sr.AudioFile(audio_io) as source:
-                audio = self.recognizer.record(source)
-            text = self.recognizer.recognize_google(audio)
+                with sr.AudioFile(audio_io) as source:
+                    audio = self.recognizer.record(source)
+                text = self.recognizer.recognize_google(audio)
 
             # Two-stage text processing for optimal results:
             # 1. Real-time spaCy correction (optimized for Intel N95, <50ms)
@@ -480,6 +485,23 @@ class LeoScribeBot(discord.Bot):
             logger.warning(f"Text corrector initialization failed: {e}")
             logger.info("Falling back to basic text cleaning only")
         
+        # Initialize Whisper transcriber for optimized speech recognition
+        try:
+            from whisper_utils import get_transcriber
+            logger.info("Initializing Whisper transcriber...")
+            start_time = time.time()
+            transcriber = await get_transcriber("base")  # Base model for good speed/accuracy balance
+            stats = transcriber.get_performance_stats()
+            load_time = time.time() - start_time
+            logger.info(f"Whisper transcriber initialized in {load_time:.2f}s")
+            if stats["whisper_available"] and stats["model_loaded"]:
+                logger.info(f"✅ Whisper {stats['model_size']} model ready for real-time transcription")
+            else:
+                logger.info("⚠️ Whisper not available, using Google Speech Recognition fallback")
+        except Exception as e:
+            logger.warning(f"Whisper initialization failed: {e}")
+            logger.info("Falling back to Google Speech Recognition only")
+        
         # Register a generic persistent view so custom_id callbacks work after restart
         self.add_view(TranscriptionView(self, 0))
         await self.sync_commands()
@@ -624,6 +646,79 @@ async def voice_reset(ctx: discord.ApplicationContext):
     await asyncio.sleep(2.5)
 
     await ctx.respond("✅ Voice state cleared. Try **Start Recording** again in your voice channel.", ephemeral=True)
+
+
+@bot.slash_command(name="transcription_stats", description="Show transcription performance statistics.")
+async def transcription_stats(ctx: discord.ApplicationContext):
+    """Show performance stats for the transcription system."""
+    await ctx.defer(ephemeral=True)
+    
+    try:
+        from whisper_utils import get_transcriber
+        from text_corrector import get_corrector
+        
+        # Get Whisper stats
+        transcriber = await get_transcriber()
+        whisper_stats = transcriber.get_performance_stats()
+        
+        # Get text corrector stats
+        corrector = await get_corrector()
+        cache_size = len(corrector.correction_cache)
+        
+        embed = discord.Embed(
+            title="🎤 LeoScribeBot Performance Statistics",
+            color=0x00FF00,
+            timestamp=utcnow()
+        )
+        
+        # Whisper stats
+        whisper_status = "✅ Active" if whisper_stats["whisper_available"] and whisper_stats["model_loaded"] else "⚠️ Fallback"
+        embed.add_field(
+            name="Speech Recognition Engine",
+            value=f"**Status:** {whisper_status}\n"
+                  f"**Model:** {whisper_stats['model_size']}\n"
+                  f"**Transcriptions:** {whisper_stats['transcription_count']}\n"
+                  f"**Avg Time:** {whisper_stats['average_time']:.3f}s",
+            inline=True
+        )
+        
+        # Text correction stats
+        embed.add_field(
+            name="Text Correction System",
+            value=f"**Cache Size:** {cache_size}/1000\n"
+                  f"**spaCy Available:** {'✅' if corrector.nlp else '❌'}\n"
+                  f"**Phrase Corrections:** {len(corrector.phrase_corrections)}\n"
+                  f"**Word Corrections:** {len(corrector.word_corrections)}",
+            inline=True
+        )
+        
+        # Performance recommendations
+        recommendations = []
+        if whisper_stats['average_time'] > 0.5:
+            recommendations.append("• Consider using 'tiny' model for faster transcription")
+        if not whisper_stats['whisper_available']:
+            recommendations.append("• Install Whisper for better accuracy and offline operation")
+        if cache_size > 800:
+            recommendations.append("• Text correction cache is nearly full (good performance)")
+        
+        if recommendations:
+            embed.add_field(
+                name="💡 Recommendations",
+                value="\n".join(recommendations),
+                inline=False
+            )
+        else:
+            embed.add_field(
+                name="✅ Performance Status",
+                value="All systems operating optimally!",
+                inline=False
+            )
+        
+        await ctx.respond(embed=embed, ephemeral=True)
+        
+    except Exception as e:
+        logger.error(f"Error getting transcription stats: {e}")
+        await ctx.respond("❌ Error retrieving performance statistics.", ephemeral=True)
 
 
 # Legacy prefix command (optional): !voice_reset
