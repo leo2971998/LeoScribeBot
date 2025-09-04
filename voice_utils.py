@@ -1,19 +1,16 @@
+# voice_utils.py
 import asyncio
 import logging
-from typing import Optional
 import discord
 
 logger = logging.getLogger(__name__)
 
 class VoiceConnectError(Exception):
-    """Raised when voice connection fails after retries"""
     pass
 
 def ensure_opus_loaded():
-    """Ensure Opus codec is loaded for voice functionality"""
     try:
         if not discord.opus.is_loaded():
-            # Try common names for the Opus shared library on Linux
             for lib in ('libopus.so.0', 'libopus.so', 'opus'):
                 try:
                     discord.opus.load_opus(lib)
@@ -22,16 +19,13 @@ def ensure_opus_loaded():
                 except OSError:
                     continue
             else:
-                logger.warning("Could not load Opus library. Install libopus0 (apt) and ffmpeg for voice support.")
+                logger.warning("Could not load Opus. Install libopus0 + ffmpeg.")
     except Exception as e:
         logger.warning(f"Opus loading failed: {e}")
 
 async def connect_voice_fresh(guild: discord.Guild, channel: discord.VoiceChannel) -> discord.VoiceClient:
-    """
-    Connect to voice channel with fresh session and retry logic for invalid voice sessions.
-    Handles common WS codes like 4006 (invalid session), and retries with backoff.
-    """
-    # Hard reset any existing connection
+    """Hard-reset any existing voice, then connect with controlled retries/backoff."""
+    # 0) Nuke any existing connection first
     if guild.voice_client:
         try:
             if hasattr(guild.voice_client, "stop_recording"):
@@ -41,34 +35,36 @@ async def connect_voice_fresh(guild: discord.Guild, channel: discord.VoiceChanne
                     pass
             await guild.voice_client.disconnect(force=True)
         except Exception as e:
-            logger.warning(f"Error cleaning up old voice connection: {e}")
-        await asyncio.sleep(1.0)
+            logger.warning(f"Error cleaning old voice connection: {e}")
+        # Give Discord time to fully drop the old session
+        await asyncio.sleep(2.0)
 
     delay = 1.0
-    for attempt in range(1, 6):  # up to 5 attempts
+    for attempt in range(1, 6):
         try:
-            logger.info(f"Voice connection attempt {attempt} for {guild.name}")
-            vc = await channel.connect()
+            logger.info(f"Voice connect attempt {attempt} in guild '{guild.name}'")
+            # IMPORTANT: disable internal reconnect loop; we handle retries here
+            vc = await channel.connect(timeout=15, reconnect=False, self_deaf=True)
 
-            # Wait for connection to become ready
-            for _ in range(20):  # ~5s
+            # Wait for ready
+            # Some environments need a moment after the WS handshake to be 'connected'
+            for _ in range(40):  # up to ~10s
                 if vc.is_connected():
-                    logger.info(f"Voice connected successfully to {channel.name}")
+                    logger.info(f"Voice connected to {channel.name}")
                     return vc
                 await asyncio.sleep(0.25)
 
-            # Connected but didn't become ready in time
             try:
-                await vc.disconnect()
+                await vc.disconnect(force=True)
             except Exception:
                 pass
-            raise VoiceConnectError("Voice connected but not ready in time")
+            raise VoiceConnectError("Voice connected but did not become ready in time")
 
         except discord.errors.ConnectionClosed as e:
             code = getattr(e, "code", None)
-            # The most common: 4006 invalid session; also handle a couple other "try fresh" codes
+            # 4006 invalid session, 4009 session timeout, 4014 kicked/permissions changes
             if code in (4006, 4009, 4014):
-                logger.warning(f"Voice WS {code} on attempt {attempt}; retrying in {delay:.1f}s…")
+                logger.warning(f"Voice WS {code} on attempt {attempt}; backoff {delay:.1f}s…")
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 8.0)
                 continue
@@ -76,7 +72,7 @@ async def connect_voice_fresh(guild: discord.Guild, channel: discord.VoiceChanne
             raise
 
         except Exception as e:
-            logger.warning(f"Voice connection attempt {attempt} failed: {e}; retrying in {delay:.1f}s…")
+            logger.warning(f"Voice connect attempt {attempt} failed: {e}; backoff {delay:.1f}s…")
             await asyncio.sleep(delay)
             delay = min(delay * 2, 8.0)
 
