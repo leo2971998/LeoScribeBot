@@ -1,8 +1,9 @@
-# voice_utils.py - Guild-specific 4006 handling
+# voice_utils.py
 import asyncio
 import logging
+from typing import Iterable, Optional, Set, Dict
+
 import discord
-from contextlib import suppress
 
 logger = logging.getLogger(__name__)
 
@@ -10,17 +11,34 @@ class VoiceConnectError(Exception):
     """Raised when voice connection fails after retries."""
     pass
 
-# Track problematic guilds that need special handling
-PROBLEMATIC_GUILDS = {
-    884793798679482458,  # Study guild ID from your logs
+# ---- Problematic guild handling ------------------------------------------------
+
+# Seed with the guild IDs you’ve seen repeatedly fail (you can add/remove safely).
+# Example IDs from your logs:
+#   Study:        884793798679482458
+#   Happy Home:   1336548070187335703
+PROBLEM_GUILDS: Set[int] = {
+    884793798679482458,
+    1336548070187335703,
 }
+
+# Prefer regions that we’ve seen succeed (HK often works when SIN/ATL fail).
+PREFERRED_REGIONS: Dict[int, Iterable[str]] = {
+    884793798679482458: ("hongkong", "us-south", "us-central"),   # Study
+    1336548070187335703: ("us-south", "us-central", "hongkong"),  # Happy Home
+}
+
+# Fallback regions to try if a guild isn’t in the map above
+DEFAULT_REGIONS: Iterable[str] = ("hongkong", "us-south", "us-central", "singapore")
+
+
+# ---- Opus loader --------------------------------------------------------------
 
 def ensure_opus_loaded():
     """Ensure the Opus codec is available for voice features."""
     try:
         if discord.opus.is_loaded():
             return
-        # Try common library names/paths
         candidates = ["libopus.so.0", "libopus.so", "opus"]
         for lib in candidates:
             try:
@@ -29,195 +47,182 @@ def ensure_opus_loaded():
                 return
             except OSError:
                 continue
-        logger.warning(
-            "Could not load Opus library. Install it on your system "
-            "(e.g., `sudo apt-get install -y libopus0`)."
-        )
+        logger.warning("Could not load Opus library. Install libopus0 (apt) if you need voice.")
     except Exception as e:
-        logger.warning(f"Opus loading attempt failed: {e}")
+        logger.warning(f"Opus loading failed: {e}")
+
+
+# ---- Internal helpers ---------------------------------------------------------
+
+async def _hard_reset_voice_state(guild: discord.Guild):
+    """Brutally clear any voice state on both client and Discord side."""
+    # Disconnect current VC (if any)
+    vc = guild.voice_client
+    if vc is not None:
+        try:
+            if hasattr(vc, "stop_recording"):
+                with suppress(Exception):
+                    vc.stop_recording()
+            await vc.disconnect(force=True)
+        except Exception as e:
+            logger.debug(f"While disconnecting old VC: {e}")
+
+    # Clear voice state on the guild
+    try:
+        await guild.change_voice_state(channel=None, self_mute=True, self_deaf=True)
+    except Exception as e:
+        logger.debug(f"While clearing guild voice state: {e}")
+
+    await asyncio.sleep(2.0)  # give Discord time to really drop the session
+
+
+async def _bridge_endpoint_rotation(
+    guild: discord.Guild,
+    base_channel: discord.VoiceChannel,
+    regions_to_try: Iterable[str],
+) -> bool:
+    """
+    Force Discord to assign a different voice endpoint by briefly creating a
+    temporary voice channel with a specific rtc_region and connecting to it.
+
+    Returns True if we managed to perform at least one bridge connect.
+    """
+    me = guild.me or await guild.fetch_member(guild.client.user.id)
+    perms = base_channel.permissions_for(me)
+    if not perms.manage_channels:
+        logger.debug("No Manage Channels; cannot run bridge endpoint rotation.")
+        return False
+
+    category = base_channel.category
+    bridged = False
+
+    for region in regions_to_try:
+        try:
+            tmp = await guild.create_voice_channel(
+                name="leoscribe-bridge",
+                rtc_region=region,
+                user_limit=1,
+                bitrate=min(64000, guild.bitrate_limit or 64000),
+                category=category,
+                reason=f"Endpoint rotation bridge (region={region})",
+            )
+        except Exception as e:
+            logger.debug(f"Create bridge VC failed (region={region}): {e}")
+            continue
+
+        try:
+            # Connect to the bridge channel to make Discord allocate an endpoint
+            logger.info(f"Bridge connect to region '{region}'…")
+            vc = await tmp.connect(timeout=20, reconnect=False)
+
+            # Wait briefly; if we get here, the gateway accepted a fresh session
+            for _ in range(10):
+                if vc.is_connected():
+                    break
+                await asyncio.sleep(0.3)
+
+            with suppress(Exception):
+                await vc.disconnect(force=True)
+            bridged = True
+        except discord.errors.ConnectionClosed as e:
+            logger.warning(f"Bridge connect failed (region={region}), WS code={getattr(e,'code',None)}")
+        except Exception as e:
+            logger.debug(f"Bridge connect error (region={region}): {e}")
+        finally:
+            with suppress(Exception):
+                await tmp.delete(reason="Cleanup bridge VC")
+            await asyncio.sleep(1.0)
+
+    return bridged
+
+
+class suppress:
+    """Tiny context manager to suppress a given exception type (or all)."""
+    def __init__(self, *exc_types):
+        self.exc_types = exc_types or (Exception,)
+
+    def __enter__(self):  # noqa: D401
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return exc_type is not None and issubclass(exc_type, self.exc_types)
+
+
+# ---- Public connect helper ----------------------------------------------------
 
 async def connect_voice_fresh(
     guild: discord.Guild,
     channel: discord.VoiceChannel,
+    *,
+    base_attempts: int = 3,
+    problem_attempts: int = 5,
 ) -> discord.VoiceClient:
     """
-    Robustly connect to a voice channel with guild-specific handling.
-    Special handling for guilds with persistent 4006 issues.
+    Connect to `channel` with aggressive cleanup and recovery from 4006/4009/4014.
+
+    On repeated 4006s, performs a "nuclear reset" and tries a bridge channel with
+    region overrides to rotate the assigned endpoint. Guilds seen failing are
+    tracked in PROBLEM_GUILDS for stronger handling.
     """
+    # Always start with a hard reset to avoid lingering voice state
+    await _hard_reset_voice_state(guild)
 
-    async def _hard_reset():
-        """Forcefully drop any existing voice session and clear voice state."""
-        vc = guild.voice_client
-        if vc:
-            try:
-                if hasattr(vc, "stop_recording"):
-                    with suppress(Exception):
-                        vc.stop_recording()
-                await vc.disconnect(force=True)
-            except Exception as e:
-                logger.warning(f"Error disconnecting existing voice client: {e}")
-
-        # Clear voice state on Discord's side
-        with suppress(Exception):
-            await guild.change_voice_state(channel=None, self_mute=True, self_deaf=True)
-
-        # Extra delay for problematic guilds
-        delay = 5.0 if guild.id in PROBLEMATIC_GUILDS else 2.5
-        await asyncio.sleep(delay)
-
-    async def _reuse_or_move() -> discord.VoiceClient | None:
-        """If already connected, reuse or move to the requested channel."""
-        vc = guild.voice_client
-        if not vc:
-            return None
-        try:
-            if vc.is_connected():
-                if vc.channel and vc.channel.id == channel.id:
-                    logger.info("Reusing existing voice connection")
-                    return vc
-                await vc.move_to(channel)
-                # Wait for move to complete
-                for _ in range(20):
-                    if vc.channel and vc.channel.id == channel.id:
-                        logger.info(f"Moved voice to {channel.name}")
-                        return vc
-                    await asyncio.sleep(0.25)
-                # Move didn't settle—reset and start fresh
-                await _hard_reset()
-                return None
-            else:
-                await _hard_reset()
-                return None
-        except Exception as e:
-            logger.warning(f"Failed to reuse/move voice client: {e}")
-            await _hard_reset()
-            return None
-
-    async def _nuclear_reset_for_problematic_guild():
-        """Extreme measures for guilds with persistent 4006 issues."""
-        logger.warning(f"Applying nuclear reset for problematic guild {guild.name}")
-        
-        # Multiple hard resets with increasing delays
-        for i in range(3):
-            await _hard_reset()
-            await asyncio.sleep(3 + i * 2)
-        
-        # Try to force a different endpoint by changing bot presence
-        try:
-            bot = channel.guild.me._state._get_client()
-            current_activity = bot.activity
-            
-            # Cycle through different statuses to potentially get a different endpoint
-            await bot.change_presence(status=discord.Status.idle, activity=None)
-            await asyncio.sleep(2)
-            await bot.change_presence(status=discord.Status.dnd, activity=None)
-            await asyncio.sleep(2)
-            await bot.change_presence(status=discord.Status.online, activity=current_activity)
-            await asyncio.sleep(3)
-        except Exception as e:
-            logger.warning(f"Presence cycling failed: {e}")
-
-    # Check if this is a problematic guild
-    is_problematic = guild.id in PROBLEMATIC_GUILDS
-    if is_problematic:
-        logger.info(f"Using special handling for problematic guild: {guild.name}")
-
-    # Try to reuse/move first
-    reused = await _reuse_or_move()
-    if reused:
-        return reused
-
-    # Set parameters based on guild type
-    if is_problematic:
-        attempts = 3  # Fewer attempts but more aggressive resets
-        base_delay = 2.0
-        max_delay = 12.0
-    else:
-        attempts = 5
-        base_delay = 1.0
-        max_delay = 8.0
-
-    delay = base_delay
+    # More attempts for guilds we've marked as problematic
+    max_attempts = problem_attempts if guild.id in PROBLEM_GUILDS else base_attempts
     consecutive_4006 = 0
 
-    for attempt in range(1, attempts + 1):
-        try:
-            logger.info(f"Voice connect attempt {attempt}/{attempts} for guild '{guild.name}'")
+    # Region list to try for this guild if we need to rotate endpoints
+    regions_to_try = PREFERRED_REGIONS.get(guild.id, DEFAULT_REGIONS)
 
-            # Re-check reuse in case state changed between attempts
-            reused = await _reuse_or_move()
-            if reused:
-                return reused
+    for attempt in range(1, max_attempts + 1):
+        logger.info(f"Voice connect attempt {attempt}/{max_attempts} for guild '{guild.name}'")
 
-            # For problematic guilds on 4006 streaks, do nuclear reset
-            if is_problematic and consecutive_4006 >= 2:
-                await _nuclear_reset_for_problematic_guild()
-                consecutive_4006 = 0
-
-            # Connect fresh with longer timeout for problematic guilds
-            timeout = 25 if is_problematic else 15
-            vc = await channel.connect(timeout=timeout, reconnect=False)
-
-            # Deafen the bot after connect
+        # If we’ve seen lots of 4006s, do a nuclear reset + bridge before retrying
+        if consecutive_4006 >= 1:
+            logger.warning(f"Applying nuclear reset for guild {guild.name}")
+            await _hard_reset_voice_state(guild)
             with suppress(Exception):
-                await guild.change_voice_state(channel=channel, self_deaf=True, self_mute=False)
+                await _bridge_endpoint_rotation(guild, channel, regions_to_try)
+            # After bridge, small pause before re-connecting
+            await asyncio.sleep(1.0)
 
-            # Extended wait for problematic guilds
-            check_iterations = 60 if is_problematic else 40
-            for _ in range(check_iterations):
+        try:
+            vc = await channel.connect(timeout=20, reconnect=False)
+
+            # Wait for ready; discord.py logs the handshake, but we poll readiness
+            for _ in range(20):
                 if vc.is_connected():
                     logger.info(f"Voice connected successfully to {channel.name}")
-                    consecutive_4006 = 0  # Reset counter on success
                     return vc
                 await asyncio.sleep(0.25)
 
-            # Connected but never became ready
+            # Connected but not “ready” fast enough, try again cleanly
             with suppress(Exception):
                 await vc.disconnect(force=True)
-            raise VoiceConnectError("Voice connected but did not become ready in time")
+            await asyncio.sleep(1.0)
+            raise VoiceConnectError("Voice connected but not ready in time")
 
         except discord.errors.ConnectionClosed as e:
             code = getattr(e, "code", None)
-            if code in (4006, 4009, 4014):
+            if code == 4006:  # Invalid session
                 consecutive_4006 += 1
-                logger.warning(f"Voice WS {code} on attempt {attempt}; consecutive: {consecutive_4006}")
-                
-                if is_problematic and code == 4006:
-                    # For problematic guilds with 4006, skip to nuclear reset
-                    await _nuclear_reset_for_problematic_guild()
-                else:
-                    await _hard_reset()
-                
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, max_delay)
+                PROBLEM_GUILDS.add(guild.id)  # mark this guild for stronger handling next time
+                logger.warning(f"Voice WS 4006 on attempt {attempt}; consecutive: {consecutive_4006}")
+                # Loop will nuclear-reset/bridge before next attempt
+                await asyncio.sleep(min(2.0 * consecutive_4006, 6.0))
                 continue
-
-            logger.error(f"Voice ConnectionClosed (code={code}): {e}")
-            raise
-
-        except discord.ClientException as e:
-            if "Already connected to a voice channel" in str(e):
-                reused = await _reuse_or_move()
-                if reused:
-                    return reused
-                await _hard_reset()
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, max_delay)
+            elif code in (4009, 4014):  # Session timeout / Voice channel kicked
+                logger.warning(f"Voice WS {code} on attempt {attempt}; hard reset and retry")
+                await _hard_reset_voice_state(guild)
+                await asyncio.sleep(2.0)
                 continue
-            raise
+            else:
+                logger.error(f"Voice gateway closed (code={code})")
+                raise
 
         except Exception as e:
             logger.warning(f"Voice connect attempt {attempt} failed: {e}")
-            if is_problematic:
-                await _nuclear_reset_for_problematic_guild()
-            else:
-                await _hard_reset()
-            await asyncio.sleep(delay)
-            delay = min(delay * 2, max_delay)
+            await asyncio.sleep(min(1.0 * attempt, 5.0))
+            continue
 
-    # Mark this guild as problematic if it wasn't already
-    if guild.id not in PROBLEMATIC_GUILDS:
-        logger.error(f"Adding guild {guild.name} to problematic guilds list")
-        PROBLEMATIC_GUILDS.add(guild.id)
-
-    raise VoiceConnectError(f"Failed to connect to voice after {attempts} attempts")
+    raise VoiceConnectError(f"Failed to connect to voice after {max_attempts} attempts")
