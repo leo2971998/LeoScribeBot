@@ -480,10 +480,10 @@ class LeoScribeBot(discord.Bot):
     @tasks.loop(seconds=1)
     async def check_for_silence(self):
         """When a user stops talking for a bit, transcribe their buffered audio."""
-        for _gid, sink in list(self.active_sessions.items()):
+        for _gid, sink in list(self.active_sessions.items()):  # ← snapshot
             if not sink.processing:
                 continue
-            for user_id, buffer in list(sink.user_buffers.items()):
+            for user_id, buffer in list(sink.user_buffers.items()):  # ← snapshot
                 if buffer.is_silent() and buffer.audio_frames:
                     audio_data = buffer.get_audio_data()
                     buffer.clear()
