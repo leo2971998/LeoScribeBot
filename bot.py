@@ -13,9 +13,13 @@ from typing import Dict
 from contextlib import suppress
 
 import discord
-from discord.ext import tasks
+from discord.ext import tasks, commands
 import speech_recognition as sr
-
+DEBUG_GUILD_IDS = [
+    884793798679482458,  # Study
+    1336548070187335703, # Happy Home
+    731364699526004747,  # Lớp học thầy Tùng (works)
+]
 # Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("LeoScribeBot")
@@ -505,7 +509,11 @@ class LeoScribeBot(discord.Bot):
 # Slash Commands
 # ─────────────────────────────
 bot = LeoScribeBot()
-@bot.slash_command(name="setup", description="Create a dedicated channel with interactive controls")
+@bot.slash_command(
+    name="setup",
+    description="Create a dedicated channel with interactive controls",
+    guild_ids=DEBUG_GUILD_IDS
+)
 async def setup_command(ctx: discord.ApplicationContext):
     if not ctx.user.guild_permissions.manage_channels:
         await ctx.respond("❌ You need 'Manage Channels' permission to use this command.", ephemeral=True)
@@ -560,7 +568,11 @@ async def setup_command(ctx: discord.ApplicationContext):
         logger.error(f"Error creating channel: {e}")
         await ctx.respond("❌ An error occurred while creating the channel.", ephemeral=True)
 
-@bot.slash_command(name="voice_reset", description="Force-clear the bot's voice session for this server.")
+@bot.slash_command(
+    name="voice_reset",
+    description="Force-clear the bot's voice session for this server.",
+    guild_ids=DEBUG_GUILD_IDS
+)
 async def voice_reset(ctx: discord.ApplicationContext):
     await ctx.defer(ephemeral=True)
 
