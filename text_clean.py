@@ -1,92 +1,82 @@
 # text_clean.py
-from __future__ import annotations
 import re
-from typing import Iterable, Optional, Set
 
-_WS_RE = re.compile(r"[ \t]+")
-_NL_WS_RE = re.compile(r" ?\n ?")
-_ELLIPSIS_RE = re.compile(r"\.\.\.+")
-_DOUBLE_DASH_RE = re.compile(r"--")
-_PUNCT_WS_BEFORE = re.compile(r"\s+([,.:;!?…])")       # space before punctuation
-_PUNCT_WS_AFTER = re.compile(r"([,.:;!?…])([^\s\W])")  # missing space after punctuation
+# Optional niceties: work even if not installed
+try:
+    from ftfy import fix_text       # unicode cleanup
+except Exception:
+    fix_text = lambda s: s
 
-# >=3 letters like "D i a d e m" or "S a p h r y n"
-_SPELLED_WORD_RE = re.compile(r"\b(?:[A-Za-z]\s){2,}[A-Za-z]\b")
+try:
+    import smartypants as _sp       # curly quotes/dashes (optional)
+except Exception:
+    _sp = None
 
-def _sentence_case(text: str) -> str:
-    out = []
-    cap_next = True
-    for ch in text:
-        if cap_next and ch.isalpha():
-            out.append(ch.upper())
-            cap_next = False
-        else:
-            out.append(ch)
-        if ch in ".!?…\n":
-            cap_next = True
-    return "".join(out)
+# Join spaced letters like "D i a d e m" -> "Diadem", "R y a n" -> "Ryan"
+_SPACED_LETTERS = re.compile(r"\b(?:[A-Za-z]\s){2,}[A-Za-z]\b")
 
-def _apply_glossary(text: str, glossary: Optional[Iterable[str]]) -> str:
-    if not glossary:
-        return text
-    for term in sorted(glossary, key=len, reverse=True):
-        text = re.sub(rf"\b{re.escape(term)}\b", term, flags=re.IGNORECASE)
-    return text
+def _collapse_spelled_words(s: str, protected: set | None = None) -> str:
+    if not s:
+        return s
+    def repl(m):
+        token = m.group(0)
+        joined = token.replace(" ", "")
+        if protected and (token in protected or joined in protected):
+            return token
+        return joined
+    return _SPACED_LETTERS.sub(repl, s)
 
-def _collapse_spelled_words(
-    text: str,
-    glossary: Optional[Iterable[str]] = None,
-    protected: Optional[Iterable[str]] = None
-) -> str:
-    gl_map = {g.lower(): g for g in (glossary or [])}
-    prot_set: Set[str] = set(p.lower() for p in (protected or []))
+def _normalize_spacing_punct(s: str) -> str:
+    # remove spaces before punctuation, ensure one space after sentence enders, collapse doubles
+    s = re.sub(r"\s+([,.;:!?])", r"\1", s)
+    s = re.sub(r"([.!?])([^\s])", r"\1 \2", s)
+    s = re.sub(r"\s{2,}", " ", s)
+    return s.strip()
 
-    def repl(m: re.Match) -> str:
-        raw = m.group(0)
-        if raw.lower() in prot_set:
-            return raw
-        joined = raw.replace(" ", "")
-        if joined.lower() in gl_map:
-            return gl_map[joined.lower()]
-        # simple “looks like a name/word” heuristic
-        return joined[0].upper() + joined[1:] if joined[:1].isalpha() else joined
+def _sentence_case(s: str) -> str:
+    # capitalize first alphabetic character in a sentence
+    for i, ch in enumerate(s.lstrip()):
+        if ch.isalpha():
+            lead = s[:len(s) - len(s.lstrip())]
+            return lead + s.lstrip()[:i] + ch.upper() + s.lstrip()[i+1:]
+    return s
 
-    return _SPELLED_WORD_RE.sub(repl, text)
+def _split_sentences(s: str) -> list[str]:
+    return re.split(r"(?<=[.!?])\s+", s)
 
 def clean_transcript(
-    raw: str,
-    *,
-    collapse_spelled: bool = True,      # join D i a d e m → Diadem in CONTENT
+    text: str,
+    collapse_spelled: bool = True,
     enforce_sentence_case: bool = True,
     normalize_punct: bool = True,
-    glossary: Optional[Iterable[str]] = None,
-    protected_spelled: Optional[Iterable[str]] = None,
+    glossary: list[str] | None = None,      # e.g. ["Diadem", "Vurndharth", "Saphryn"]
+    protected_spelled: list[str] | None = None,  # spelled forms you DON'T want joined
+    smart_quotes: bool = False
 ) -> str:
-    if not raw:
-        return raw
+    """
+    Light, fast post-process for ASR output. No network calls.
+    """
+    if not text:
+        return text
 
-    text = raw
+    out = fix_text(text)  # unicode / weird quotes, if ftfy available
 
-    # 1) whitespace tidy
-    text = _WS_RE.sub(" ", text)
-    text = _NL_WS_RE.sub("\n", text).strip()
-
-    # 2) punctuation tidy
-    if normalize_punct:
-        text = _ELLIPSIS_RE.sub("…", text)        # ... → …
-        text = _DOUBLE_DASH_RE.sub("—", text)     # -- → —
-        text = _PUNCT_WS_BEFORE.sub(r"\1", text)  # no spaces before ,.!?…
-        text = _PUNCT_WS_AFTER.sub(r"\1 \2", text)
-
-    # 3) optionally join s p a c e d  w o r d s
     if collapse_spelled:
-        text = _collapse_spelled_words(text, glossary=glossary, protected=protected_spelled)
+        out = _collapse_spelled_words(out, set(protected_spelled or []))
 
-    # 4) sentence case
+    if normalize_punct:
+        out = _normalize_spacing_punct(out)
+
     if enforce_sentence_case:
-        text = _sentence_case(text)
+        sents = [_sentence_case(s) for s in _split_sentences(out)]
+        out = " ".join(sents)
 
-    # 5) glossary casing (optional)
-    text = _apply_glossary(text, glossary)
+    if glossary:
+        # Canonicalize key terms’ casing (case-insensitive replace)
+        for term in glossary:
+            out = re.sub(rf"\b{re.escape(term)}\b", term, out, flags=re.IGNORECASE)
 
-    return text
+    if smart_quotes and _sp:
+        out = _sp.smartypants(out)
+
+    return out
