@@ -1,0 +1,258 @@
+--- Stormlight Archive Terms ---
+--- Characters ---
+Aidaelan > Adolin Kholin
+Aedolin > Adolin Kholin
+Adelin > Adolin Kholin
+Dalanar > Dalinar Kholin
+Ashonai > Eshonai
+Gavalar > Gavilar Kholin
+Yazna Colline > Jasnah Kholin
+Yansna > Jasnah Kholin
+Yesnah > Jasnah Kholin
+Caladin > Kaladin
+Calladan > Kaladin
+Lopun > Lopen
+Shalan > Shallan Davar
+Dvar > Shallan Davar
+Sil > Sylphrena
+Syl > Sylphrena
+Zef > Szeth-son-son-Vallano
+Szetzh > Szeth-son-son-Vallano
+Zeth Sun Sun Ballano > Szeth-son-son-Vallano
+Terovangion > Taravangian
+Amaran > Amaram
+Saddeus > Sadeas
+Sadius > Sadeas
+
+--- Magic, Concepts, & Spren ---
+search binding > Surgebinding
+surge binding > Surgebinding
+search binder > Surgebinder
+surge binder > Surgebinder
+investiture > Investiture
+investature > Investiture
+storm light > Stormlight
+shard plate > Shardplate
+shard blade > Shardblade
+soul casting > Soulcasting
+fabriel > Fabrial
+spren > Spren
+afah'liki > Spren
+honor spren > Honorspren
+cryptic > Cryptic
+krem > Crem
+
+--- Geography & Peoples ---
+rochelle > Roshar
+rochar > Roshar
+aleth car > Alethkar
+alysear > Alethkar
+yaka ved > Jah Keved
+yakaved > Jah Keved
+carbranth > Kharbranth
+uritheru > Urithiru
+yurusu > Urithiru
+shinova > Shinovar
+parshendi > Parshendi / Singers
+unkalaki > Unkalaki
+voranism > Vorinism
+voran > Vorinism
+
+--- Dungeons & Dragons Terms ---
+--- Player Species / Lineages ---
+arakocra > Aarakocra
+aarakokra > Aarakocra
+aracokra > Aarakocra
+asimar > Aasimar
+aasimer > Aasimar
+duerger > Duergar
+durgar > Duergar
+eladran > Eladrin
+eledrin > Eladrin
+genasi > Genasi
+genassi > Genasi
+gith yanki > Githyanki
+githanki > Githyanki
+gith zerai > Githzerai
+githzeri > Githzerai
+shadar kai > Shadar-Kai
+shader-kai > Shadar-Kai
+svirfneblin > Svirfneblin
+svirfneblen > Svirfneblin
+thri kreen > Thri-Kreen
+thri-kren > Thri-Kreen
+yuan ti > Yuan-Ti Pureblood
+yaun-ti > Yuan-Ti Pureblood
+yanti > Yuan-Ti Pureblood
+
+--- Classes & Subclasses ---
+artillerist > Artillerist
+Artilierist > Artillerist
+Alcamist > Alchemist
+Alchamist > Alchemist
+Path of the Zelot > Path of the Zealot
+Oath of the Zealot > Path of the Zealot
+Battle Rager > Path of the Battlerager
+College of Eloquense > College of Eloquence
+College of Glamer > College of Glamour
+Graves Domain > Grave Domain
+Twilight Demesne > Twilight Domain
+Circle of Twilight > Twilight Domain
+Circle of the Spore > Circle of Spores
+Circle of Wild Fire > Circle of Wildfire
+Eldrich Knight > Eldritch Knight
+Elder Knight > Eldritch Knight
+Psy Warrior > Psi Warrior
+Psychic Warrior > Psi Warrior
+Way of the Kensi > Way of the Kensei
+Way of the Sensei > Way of the Kensei
+Way of the Ascendent Dragon > Way of the Ascendant Dragon
+Oath of Vengence > Oath of Vengeance
+Oath Breaker > Oathbreaker
+gloomstalker > Gloom Stalker
+gloom stocker > Gloom Stalker
+Drake Warden > Drakewarden
+Dragon Warden > Drakewarden
+Arcane Trikster > Arcane Trickster
+Swash Buckler > Swashbuckler
+Swashbucker > Swashbuckler
+Abberant Mind > Aberrant Mind
+Aberant Mind > Aberrant Mind
+Dragon Bloodline > Draconic Bloodline
+Dragonic Bloodline > Draconic Bloodline
+hex blade > The Hexblade
+hexblade > The Hexblade
+The Fathomles > The Fathomless
+The Fathom Less > The Fathomless
+Blade Singing > Bladesinging
+Bladesinger > Bladesinging
+chronergy magic > Chronurgy Magic
+chronorgy > Chronurgy Magic
+chronomancy > Chronurgy Magic
+
+--- Monsters ---
+be holder > Beholder
+beholder > Beholder
+mind flair > Mind Flayer
+mindflayer > Mind Flayer
+litch > Lich
+tarasque > Tarrasque
+terrasque > Tarrasque
+gelatinus cube > Gelatinous Cube
+gelatinous cube > Gelatinous Cube
+owl bear > Owlbear
+mimac > Mimic
+mimick > Mimic
+cobold > Kobold
+astral dreadnaught > Astral Dreadnought
+
+--- Magic Items ---
+bag of holding > Bag of Holding
+deck of many things > Deck of Many Things
+vorpal sword > Vorpal Sword
+vorple sword > Vorpal Sword
+immovable rod > Immovable Rod
+unmovable rod > Immovable Rod
+black razor > Blackrazor
+blackrazer > Blackrazor
+wave > Wave
+whelm > Whelm
+sword of kas > Sword of Kas
+wand of orcus > Wand of Orcus
+axe of the dwarven lords > Axe of the Dwarvish Lords
+
+--- Locations (Forgotten Realms) ---
+balders gate > Baldur's Gate
+baulders gate > Baldur's Gate
+baldur gate > Baldur's Gate
+water deep > Waterdeep
+never winter > Neverwinter
+icewind dale > Icewind Dale
+ice wind dale > Icewind Dale
+menzoberanzan > Menzoberranzan
+menzoberranzen > Menzoberranzan
+candle keep > Candlekeep
+phandelin > Phandalin
+fandalin > Phandalin
+elturel > Elturel
+elturell > Elturel
+
+--- Deities ---
+lloth > Lolth
+vecna > Vecna
+tiamet > Tiamat
+bahamet > Bahamut
+moridin > Moradin
+grumsh > Gruumsh
+grummsh > Gruumsh
+kurtulmac > Kurtulmak
+selune > Selûne
+shar > Shar
+mistra > Mystra
+mystara > Mystra
+takisis > Takhisis
+takhis > Takhisis
+
+--- Factions ---
+harpers > The Harpers
+order of the gauntlet > The Order of the Gauntlet
+emerald enclave > The Emerald Enclave
+lords alliance > The Lords' Alliance
+lord's alliance > The Lords' Alliance
+zentarim > The Zhentarim
+zhentrim > The Zhentarim
+the zhents > The Zhentarim
+
+--- Spells ---
+elder blast > Eldritch Blast
+eldrich blast > Eldritch Blast
+magic missle > Magic Missile
+magic missile > Magic Missile
+fire ball > Fireball
+guiding bolt > Guiding Bolt
+guding bolt > Guiding Bolt
+prestidigitation > Prestidigitation
+prestadigitation > Prestidigitation
+thaumatergy > Thaumaturgy
+thumaturgy > Thaumaturgy
+phantasmal killer > Phantasmal Killer
+fantasmal killer > Phantasmal Killer
+polimorph > Polymorph
+polymorf > Polymorph
+mordenkainens magnificent mansion > Mordenkainen's Magnificent Mansion
+mordenkinens mansion > Mordenkainen's Magnificent Mansion
+tensers floating disk > Tenser's Floating Disk
+tenser floating disk > Tenser's Floating Disk
+bigbys hand > Bigby's Hand
+bigby hand > Bigby's Hand
+leomunds tiny hut > Leomund's Tiny Hut
+leomund tiny hut > Leomund's Tiny Hut
+otilukes resilient sphere > Otiluke's Resilient Sphere
+otiluke sphere > Otiluke's Resilient Sphere
+evards black tentacles > Evard's Black Tentacles
+everards black tentacles > Evard's Black Tentacles
+
+--- Baldur's Gate 3 Characters ---
+a star on > Astarion
+astarion > Astarion
+shadow heart > Shadowheart
+shadowheart > Shadowheart
+laezel > Lae'zel
+layzel > Lae'zel
+lie-zell > Lae'zel
+gale > Gale
+wyll > Wyll
+will > Wyll
+karlac > Karlach
+karlak > Karlach
+halsin > Halsin
+halsen > Halsin
+minthara > Minthara
+menthara > Minthara
+jahera > Jaheira
+jahira > Jaheira
+minsc > Minsc
+orpheus > Orpheus
+vlakith > Vlaakith
+vlaakith > Vlaakith
+alaakith > Vlaakith
