@@ -61,7 +61,7 @@ class UserAudioBuffer:
 # Pycord WaveSink for recording
 # ─────────────────────────────────────────────────────────────────────────────
 class TranscriptionSink(discord.sinks.WaveSink):
-    def __init__(self, bot: "LeoScribeBot", channel: discord.abc.Messageable):
+    def __init__(self, bot, channel):
         super().__init__()
         self.bot = bot
         self.channel = channel
@@ -69,39 +69,58 @@ class TranscriptionSink(discord.sinks.WaveSink):
         self.recognizer = sr.Recognizer()
         self.processing = True
 
-    def write(self, data, user):
+    # NOTE: Pycord passes (pcm_bytes, user_id:int)
+    def write(self, pcm_bytes: bytes, user_id: int):
         if not self.processing:
             return
-        if user.id not in self.user_buffers:
-            self.user_buffers[user.id] = UserAudioBuffer(user.id)
-        # Pycord provides raw 48kHz 16-bit stereo PCM as data.raw_data
-        self.user_buffers[user.id].add_audio(data.raw_data)
+        if user_id not in self.user_buffers:
+            self.user_buffers[user_id] = UserAudioBuffer(user_id)
+        # Append decoded PCM bytes directly
+        self.user_buffers[user_id].add_audio(pcm_bytes)
 
     async def transcribe_and_send(self, user_id: int, audio_data: bytes):
         if not audio_data:
             return
         try:
-            # Wrap PCM in WAV container so SpeechRecognition can read it
+            # Wrap raw PCM into a WAV container for SpeechRecognition
             audio_io = io.BytesIO()
-            with wave.open(audio_io, "wb") as wav_file:
-                wav_file.setnchannels(2)
+            with wave.open(audio_io, 'wb') as wav_file:
+                wav_file.setnchannels(2)    # Pycord decodes to stereo 48k/16-bit
                 wav_file.setsampwidth(2)
                 wav_file.setframerate(48000)
                 wav_file.writeframes(audio_data)
             audio_io.seek(0)
 
-            # Transcribe via Google SpeechRecognition backend
             with sr.AudioFile(audio_io) as source:
                 audio = self.recognizer.record(source)
             text = self.recognizer.recognize_google(audio)
 
             if text.strip():
-                user = self.bot.get_user(user_id)
-                username = user.display_name if user else f"User {user_id}"
+                # Try to resolve a nice display name
+                user_obj = None
+                try:
+                    # Best: member in this guild (has display_name/nick)
+                    user_obj = getattr(self.channel, "guild", None)
+                    user_obj = user_obj.get_member(user_id) if user_obj else None
+                    if not user_obj:
+                        # Cache
+                        user_obj = self.bot.get_user(user_id)
+                    if not user_obj:
+                        # API fallback
+                        user_obj = await self.bot.fetch_user(user_id)
+                except Exception:
+                    user_obj = None
+
+                username = (
+                    getattr(user_obj, "display_name", None)
+                    or getattr(user_obj, "name", None)
+                    or f"User {user_id}"
+                )
+
                 embed = discord.Embed(
                     description=f"**{username}:** {text}",
-                    color=0x3498DB,
-                    timestamp=utcnow(),
+                    color=0x3498db,
+                    timestamp=discord.utils.utcnow()
                 )
                 await self.channel.send(embed=embed)
 
@@ -114,8 +133,6 @@ class TranscriptionSink(discord.sinks.WaveSink):
 
     def cleanup(self):
         self.processing = False
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Control Panel View
 # ─────────────────────────────────────────────────────────────────────────────
