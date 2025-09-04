@@ -1,16 +1,22 @@
 """
-Three-layer text correction system optimized for Intel N95 CPU
+Hybrid text correction system optimized for Intel N95 CPU
 Perfect for real-time transcription with fantasy gaming terms
 
-This module provides a sophisticated three-layer correction system:
+This module provides a sophisticated multi-layer correction system:
 - Layer 1: Basic transcription (handled by bot.py)
 - Layer 2: Phrase-based corrections using spaCy Matcher
 - Layer 3: Fuzzy string matching for individual words using thefuzz
+- Layer 4: LLM fallback using Phi-3 for heavily garbled text
+
+Correction Methods:
+- SPACY: Fast spaCy + fuzzy matching (sub-50ms)
+- LLM: High-quality Phi-3 corrections (1-3s)
+- HYBRID: Smart combination - spaCy first, LLM fallback if low confidence
 
 Optimized for:
-- Real-time performance (sub-50ms response)
-- Low memory usage (~50MB)
-- Offline operation
+- Real-time performance (sub-50ms for most cases)
+- Low memory usage (~50MB + 4-5GB for Phi-3)
+- Offline operation (both spaCy and local Ollama)
 - Intel N95 CPU efficiency
 - Fantasy gaming terms (Stormlight Archive, D&D)
 """
@@ -42,21 +48,38 @@ except ImportError:
     THEFUZZ_AVAILABLE = False
     fuzz = None
 
+# httpx for LLM communication
+try:
+    import httpx
+    HTTPX_AVAILABLE = True
+except ImportError:
+    HTTPX_AVAILABLE = False
+    httpx = None
+
 logger = logging.getLogger(__name__)
 
+# Configuration constants
+CORRECTION_METHOD = "HYBRID"  # Options: SPACY, LLM, HYBRID
+CONFIDENCE_THRESHOLD = 70    # Below this %, use LLM in HYBRID mode
+OLLAMA_BASE_URL = "http://127.0.0.1:11434"
+LLM_MODEL = "phi3"
+LLM_TIMEOUT = 10.0  # seconds
+
 class TextCorrector:
-    """Three-layer text corrector optimized for fantasy gaming terms"""
+    """Multi-layer text corrector with LLM fallback for fantasy gaming terms"""
     
-    def __init__(self, corrections_file="corrections.txt"):
+    def __init__(self, corrections_file="corrections.txt", method=CORRECTION_METHOD):
         self.nlp = None
         self.matcher = None
         self.is_loaded = False
         self.correction_cache: Dict[str, str] = {}
         self.max_cache_size = 1000
+        self.method = method
         
         # Storage for corrections
         self.phrase_corrections: Dict[str, str] = {}
         self.word_corrections: Dict[str, str] = {}
+        self.all_correct_terms: Set[str] = set()  # For LLM context
         
         # Load corrections from file
         self.corrections_file = corrections_file
@@ -68,6 +91,11 @@ class TextCorrector:
             (re.compile(r'\s+', re.MULTILINE), ' '),        # Multiple spaces
             (re.compile(r'([.!?])\s*([a-z])', re.MULTILINE), r'\1 \2'),  # Space after sentence end
         ]
+        
+        # HTTP client for LLM requests
+        self.http_client = None
+        if HTTPX_AVAILABLE and method in ["LLM", "HYBRID"]:
+            self.http_client = httpx.AsyncClient(timeout=LLM_TIMEOUT)
     
     def _load_corrections(self):
         """Load corrections from the file, separating phrases from single words."""
@@ -86,6 +114,9 @@ class TextCorrector:
                         incorrect = incorrect.strip().lower()
                         correct = correct.strip()
                         
+                        # Store the correct term for LLM context
+                        self.all_correct_terms.add(correct)
+                        
                         # If the incorrect term has spaces, it's a phrase
                         if ' ' in incorrect:
                             self.phrase_corrections[incorrect] = correct
@@ -95,6 +126,7 @@ class TextCorrector:
             logger.warning(f"Warning: {self.corrections_file} not found. Creating empty correction lists.")
         
         logger.info(f"Loaded {len(self.phrase_corrections)} phrase corrections and {len(self.word_corrections)} word corrections")
+        logger.info(f"Compiled {len(self.all_correct_terms)} terms for LLM context")
     
     def _setup_phrase_patterns(self):
         """Set up spaCy patterns for phrase matching."""
@@ -200,12 +232,13 @@ class TextCorrector:
             logger.debug(f"Phrase correction error: {e}")
             return text
 
-    def correct_words(self, text: str, similarity_threshold: int = 80) -> str:
-        """Layer 3: Correct individual words using fuzzy matching."""
+    def correct_words(self, text: str, similarity_threshold: int = 80) -> Tuple[str, int]:
+        """Layer 3: Correct individual words using fuzzy matching. Returns (corrected_text, confidence_score)."""
         if not THEFUZZ_AVAILABLE:
             # Fallback to exact matching for word corrections
             words = text.split()
             corrected_words = []
+            corrections_made = 0
             
             for word in words:
                 # Clean the word (remove punctuation for matching)
@@ -221,14 +254,19 @@ class TextCorrector:
                     if punctuation:
                         corrected += ''.join(punctuation)
                     corrected_words.append(corrected)
+                    corrections_made += 1
                 else:
                     corrected_words.append(word)
             
-            return ' '.join(corrected_words)
+            # Calculate confidence: fewer corrections relative to total words = higher confidence
+            confidence = max(0, 100 - (corrections_made * 20))  # Lose 20 points per correction
+            return ' '.join(corrected_words), confidence
         
         try:
             words = text.split()
             corrected_words = []
+            corrections_made = 0
+            low_confidence_corrections = 0
             
             for word in words:
                 # Clean the word (remove punctuation for matching)
@@ -244,6 +282,11 @@ class TextCorrector:
                         best_match = correct_word
                 
                 if best_match:
+                    # Track correction quality
+                    corrections_made += 1
+                    if best_score < 95:  # Low confidence fuzzy match
+                        low_confidence_corrections += 1
+                        
                     # Preserve original punctuation and capitalization context
                     if word[0].isupper():
                         best_match = best_match.capitalize()
@@ -255,18 +298,87 @@ class TextCorrector:
                 else:
                     corrected_words.append(word)
             
-            return ' '.join(corrected_words)
+            # Calculate confidence based on correction quality
+            total_words = len(words)
+            correction_rate = corrections_made / total_words if total_words > 0 else 0
+            low_confidence_rate = low_confidence_corrections / total_words if total_words > 0 else 0
+            
+            # High correction rate or many low-confidence corrections = low overall confidence
+            confidence = max(0, 100 - (correction_rate * 60) - (low_confidence_rate * 40))
+            
+            return ' '.join(corrected_words), int(confidence)
         except Exception as e:
             logger.debug(f"Word correction error: {e}")
+            return text, 50  # Medium confidence on error
+
+    async def correct_with_llm(self, text: str) -> str:
+        """Layer 4: Use Phi-3 LLM for intelligent text correction."""
+        if not HTTPX_AVAILABLE or not self.http_client:
+            logger.warning("LLM correction requested but httpx not available")
+            return text
+            
+        try:
+            # Build lexicon from corrections.txt
+            lexicon_terms = sorted(list(self.all_correct_terms))
+            lexicon_str = ', '.join(lexicon_terms[:100])  # Limit to first 100 terms to avoid token limits
+            
+            # Create the prompt
+            prompt = f"""You are an expert editor and transcriber for high-fantasy media, specializing in Dungeons & Dragons and the Cosmere. Your task is to correct a garbled sentence from a voice-to-text system and make it grammatically correct and coherent.
+
+Use the provided lexicon of known fantasy terms to help you. The output should be ONLY the corrected sentence, without any explanations.
+
+Lexicon of Known Terms:
+{lexicon_str}
+
+Garbled Text: "{text}"
+Corrected Text:"""
+
+            # Prepare the request to Ollama
+            request_data = {
+                "model": LLM_MODEL,
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature": 0.1,  # Low temperature for consistent corrections
+                    "top_p": 0.9,
+                    "stop": ["\n", "Garbled Text:", "Corrected Text:"],
+                }
+            }
+            
+            # Make the request
+            response = await self.http_client.post(
+                f"{OLLAMA_BASE_URL}/api/generate",
+                json=request_data
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                corrected_text = result.get("response", "").strip()
+                
+                # Clean up the response (remove any leftover prompt artifacts)
+                corrected_text = re.sub(r'^Corrected Text:\s*', '', corrected_text)
+                corrected_text = re.sub(r'^"(.*)"$', r'\1', corrected_text)  # Remove quotes
+                corrected_text = corrected_text.strip()
+                
+                if corrected_text and corrected_text != text:
+                    logger.debug(f"LLM correction: '{text}' -> '{corrected_text}'")
+                    return corrected_text
+                else:
+                    return text
+            else:
+                logger.error(f"LLM request failed: {response.status_code}")
+                return text
+                
+        except Exception as e:
+            logger.error(f"LLM correction error: {e}")
             return text
 
     async def correct_transcript(self, text: str) -> str:
         """
-        Three-layer text correction optimized for real-time use
-        Layer 1: Basic transcription (handled by bot.py)
-        Layer 2: Phrase-based corrections using spaCy Matcher
-        Layer 3: Fuzzy string matching for individual words
-        Target: 20-50ms response time
+        Multi-layer text correction with configurable method
+        - SPACY: Fast spaCy + fuzzy matching (20-50ms)
+        - LLM: High-quality Phi-3 corrections (1-3s)
+        - HYBRID: Smart combination - spaCy first, LLM fallback if low confidence
         """
         if not text or not text.strip():
             return text
@@ -279,21 +391,27 @@ class TextCorrector:
             return self.correction_cache[text_key]
         
         try:
-            # Start with the input text
-            corrected = text.strip()
-            
-            # Apply quick regex fixes first (very fast)
-            for pattern, replacement in self.patterns:
-                corrected = pattern.sub(replacement, corrected)
-            
-            # Layer 2: Phrase corrections (fast pattern matching)
-            corrected = self.correct_phrases(corrected)
-            
-            # Layer 3: Word corrections (fuzzy matching)
-            corrected = self.correct_words(corrected)
-            
-            # Final cleanup
-            corrected = re.sub(r'\s+', ' ', corrected).strip()
+            # Method selection
+            if self.method == "LLM":
+                # Pure LLM mode - skip spaCy, go straight to Phi-3
+                corrected = await self.correct_with_llm(text)
+                
+            elif self.method == "SPACY":
+                # Pure spaCy mode - original fast path
+                corrected = await self._correct_with_spacy(text)
+                
+            elif self.method == "HYBRID":
+                # Hybrid mode - spaCy first, then LLM if confidence is low
+                corrected, confidence = await self._correct_with_spacy_confidence(text)
+                
+                if confidence < CONFIDENCE_THRESHOLD:
+                    logger.debug(f"Low confidence ({confidence}%), using LLM fallback")
+                    corrected = await self.correct_with_llm(corrected)
+                else:
+                    logger.debug(f"High confidence ({confidence}%), keeping spaCy result")
+            else:
+                logger.warning(f"Unknown correction method: {self.method}, falling back to SPACY")
+                corrected = await self._correct_with_spacy(text)
             
             # Cache the result (with size limit)
             if len(self.correction_cache) < self.max_cache_size:
@@ -306,8 +424,8 @@ class TextCorrector:
                 self.correction_cache[text_key] = corrected
             
             processing_time = (time.time() - start_time) * 1000  # Convert to ms
-            if processing_time > 50:
-                logger.debug(f"Text correction took {processing_time:.1f}ms (target: <50ms)")
+            if processing_time > 100:  # Log if slower than expected
+                logger.debug(f"Text correction took {processing_time:.1f}ms (method: {self.method})")
             
             return corrected
             
@@ -315,42 +433,104 @@ class TextCorrector:
             logger.error(f"Text correction error: {e}")
             return text  # Return original on error
 
+    async def _correct_with_spacy(self, text: str) -> str:
+        """Original spaCy-only correction path for compatibility."""
+        # Start with the input text
+        corrected = text.strip()
+        
+        # Apply quick regex fixes first (very fast)
+        for pattern, replacement in self.patterns:
+            corrected = pattern.sub(replacement, corrected)
+        
+        # Layer 2: Phrase corrections (fast pattern matching)
+        corrected = self.correct_phrases(corrected)
+        
+        # Layer 3: Word corrections (fuzzy matching) - ignore confidence score
+        corrected, _ = self.correct_words(corrected)
+        
+        # Final cleanup
+        corrected = re.sub(r'\s+', ' ', corrected).strip()
+        
+        return corrected
+
+    async def _correct_with_spacy_confidence(self, text: str) -> Tuple[str, int]:
+        """spaCy correction with confidence scoring for hybrid mode."""
+        # Start with the input text
+        corrected = text.strip()
+        original_length = len(corrected.split())
+        
+        # Apply quick regex fixes first (very fast)
+        for pattern, replacement in self.patterns:
+            corrected = pattern.sub(replacement, corrected)
+        
+        # Layer 2: Phrase corrections (fast pattern matching)
+        phrase_corrected = self.correct_phrases(corrected)
+        phrase_changes = 1 if phrase_corrected != corrected else 0
+        corrected = phrase_corrected
+        
+        # Layer 3: Word corrections with confidence scoring
+        corrected, word_confidence = self.correct_words(corrected)
+        
+        # Final cleanup
+        corrected = re.sub(r'\s+', ' ', corrected).strip()
+        
+        # Calculate overall confidence
+        # Factors: word-level confidence, phrase changes, overall coherence
+        phrase_penalty = phrase_changes * 15  # Penalty for phrase corrections
+        
+        # Check for obviously garbled patterns
+        garbled_patterns = [
+            r'\b[a-z]\s+[a-z]\s+[a-z]\b',  # Single letters scattered
+            r'\b\w{1,2}\b.*\b\w{1,2}\b.*\b\w{1,2}\b',  # Many tiny words
+        ]
+        
+        garbled_penalty = 0
+        for pattern in garbled_patterns:
+            if re.search(pattern, corrected.lower()):
+                garbled_penalty += 20
+        
+        # Final confidence calculation
+        confidence = max(0, word_confidence - phrase_penalty - garbled_penalty)
+        
+        return corrected, confidence
+
 
 # Global instance for efficient reuse
 _corrector_instance: Optional[TextCorrector] = None
 
-async def get_corrector() -> TextCorrector:
-    """Get the global text corrector instance"""
+async def get_corrector(method: str = CORRECTION_METHOD) -> TextCorrector:
+    """Get the global text corrector instance with specified method"""
     global _corrector_instance
-    if _corrector_instance is None:
-        _corrector_instance = TextCorrector()
+    if _corrector_instance is None or _corrector_instance.method != method:
+        _corrector_instance = TextCorrector(method=method)
         await _corrector_instance.load_model()
     return _corrector_instance
 
-async def correct_transcript(text: str) -> str:
+async def correct_transcript(text: str, method: str = CORRECTION_METHOD) -> str:
     """
     Convenience function for quick text correction
-    Optimized for real-time use with Intel N95 CPU
+    Supports SPACY, LLM, and HYBRID modes
     """
-    corrector = await get_corrector()
+    corrector = await get_corrector(method)
     return await corrector.correct_transcript(text)
 
 # Performance test function
-async def benchmark_correction(sample_texts: list = None) -> dict:
-    """Benchmark the three-layer correction performance"""
+async def benchmark_correction(sample_texts: list = None, method: str = CORRECTION_METHOD) -> dict:
+    """Benchmark the correction performance for specified method"""
     if sample_texts is None:
         sample_texts = [
             "search binding is a prime manifestation of investiture on rochelle",
             "search binders can manipulate 10 fundamental forces locally known as surges",
             "eldrich blast is a powerful cantrip in dungeons and dragons",
             "the be holder is a dangerous monster with eye stalks",
-            "Ryan said he likes playing valorant with his discord friends",
+            "Search biting are prime minister Astarion of investigator on Roshar",
+            "The Beholder is the Beholder is a dangerous monster would I stocks"
         ]
     
-    corrector = await get_corrector()
+    corrector = await get_corrector(method)
     times = []
     
-    print("Testing three-layer correction system:")
+    print(f"Testing {method} correction system:")
     print("=" * 60)
     
     for text in sample_texts:
@@ -364,40 +544,67 @@ async def benchmark_correction(sample_texts: list = None) -> dict:
         print()
     
     return {
+        'method': method,
         'avg_time_ms': sum(times) / len(times),
         'max_time_ms': max(times),
         'min_time_ms': min(times),
         'cache_size': len(corrector.correction_cache),
         'spacy_available': SPACY_AVAILABLE,
         'thefuzz_available': THEFUZZ_AVAILABLE,
+        'httpx_available': HTTPX_AVAILABLE,
         'model_loaded': corrector.nlp is not None,
         'phrase_corrections': len(corrector.phrase_corrections),
         'word_corrections': len(corrector.word_corrections)
     }
 
 if __name__ == "__main__":
-    # Quick test of the three-layer system
+    # Test all correction methods
     async def test():
-        print("Testing three-layer text correction system...")
+        print("Testing hybrid text correction system...")
         print(f"spaCy available: {SPACY_AVAILABLE}")
         print(f"thefuzz available: {THEFUZZ_AVAILABLE}")
+        print(f"httpx available: {HTTPX_AVAILABLE}")
+        print()
         
-        results = await benchmark_correction()
-        print("\nPerformance results:")
-        for key, value in results.items():
-            print(f"  {key}: {value}")
+        # Test problematic examples from the issue
+        problem_examples = [
+            "The Beholder is the Beholder is a dangerous monster would I stocks",
+            "Search biting are prime minister Astarion of investigator on Roshar"
+        ]
         
-        # Test the specific example from the problem statement
-        print("\nTesting problem statement example:")
+        print("Testing problem statement examples:")
         print("=" * 60)
         
-        problem_text = "Search binding is a prime manifestation of investiture on Roche search binders can manipulate 10 fundamental forces locally known as surges by infusing objects or beings with Stormlight or some other kind of investiture"
+        for method in ["SPACY", "HYBRID"]:  # Skip LLM-only for now
+            print(f"\n{method} Method:")
+            print("-" * 30)
+            
+            for text in problem_examples:
+                try:
+                    corrector = await get_corrector(method)
+                    start = time.time()
+                    corrected = await corrector.correct_transcript(text)
+                    end = time.time()
+                    time_ms = (end - start) * 1000
+                    
+                    print(f"Input:  '{text}'")
+                    print(f"Output: '{corrected}' ({time_ms:.1f}ms)")
+                    print()
+                except Exception as e:
+                    print(f"Error with {method}: {e}")
+                    print()
         
-        corrector = await get_corrector()
-        corrected = await corrector.correct_transcript(problem_text)
+        # Benchmark each method
+        print("\nPerformance Benchmarks:")
+        print("=" * 60)
         
-        print(f"Original: {problem_text}")
-        print()
-        print(f"Corrected: {corrected}")
+        for method in ["SPACY", "HYBRID"]:
+            try:
+                results = await benchmark_correction(method=method)
+                print(f"\n{method} Method Results:")
+                for key, value in results.items():
+                    print(f"  {key}: {value}")
+            except Exception as e:
+                print(f"Benchmark failed for {method}: {e}")
     
     asyncio.run(test())

@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+# Configuration for text correction method
+CORRECTION_METHOD = "HYBRID"  # Options: "SPACY", "LLM", "HYBRID"
+CONFIDENCE_THRESHOLD = 70     # For HYBRID mode: below this %, use LLM
+
 import os
 import io
 import time
@@ -101,9 +105,9 @@ class TranscriptionSink(discord.sinks.WaveSink):
                 audio = self.recognizer.record(source)
             text = self.recognizer.recognize_google(audio)
 
-            # Two-stage text processing for optimal results:
-            # 1. Real-time spaCy correction (optimized for Intel N95, <50ms)
-            corrected = await correct_transcript(text)
+            # Multi-layer text processing for optimal results:
+            # 1. Configurable correction (spaCy, LLM, or hybrid)
+            corrected = await correct_transcript(text, method=CORRECTION_METHOD)
             
             # 2. Traditional text cleaning for final polish
             polished = clean_transcript(
@@ -471,9 +475,9 @@ class LeoScribeBot(discord.Bot):
         # Initialize text corrector for real-time performance
         try:
             from text_corrector import get_corrector
-            logger.info("Initializing real-time text corrector...")
+            logger.info(f"Initializing text corrector with method: {CORRECTION_METHOD}")
             start_time = time.time()
-            await get_corrector()  # Pre-load the corrector and spaCy model
+            await get_corrector(CORRECTION_METHOD)  # Pre-load the corrector
             load_time = time.time() - start_time
             logger.info(f"Text corrector initialized in {load_time:.2f}s")
         except Exception as e:
