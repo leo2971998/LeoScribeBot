@@ -18,7 +18,7 @@ import speech_recognition as sr
 # Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("LeoScribeBot")
-# For extra verbosity:
+# For deeper debugging:
 # logging.getLogger("discord").setLevel(logging.DEBUG)
 
 # Local modules
@@ -212,10 +212,69 @@ class TranscriptionView(discord.ui.View):
                 pass
             return
 
+        # Optional guard: if a VoiceClient is already attached, try to reuse/move it
+        existing_vc = interaction.guild.voice_client if interaction.guild else None
+        if existing_vc and existing_vc.is_connected():
+            if existing_vc.channel.id != voice_channel.id:
+                try:
+                    await existing_vc.move_to(voice_channel)
+                except Exception:
+                    # If move fails, connect_voice_fresh will handle reset/reconnect
+                    pass
+
+        # ---- Voice connect with 4006 retry ----
         try:
             voice_client = await connect_voice_fresh(interaction.guild, voice_channel)
             await asyncio.sleep(0.5)
 
+        except discord.errors.ConnectionClosed as e:
+            # Some guilds/channels throw a first-time 4006 invalid session.
+            if getattr(e, "code", None) == 4006:
+                logger.warning("Voice WS 4006 on first attempt; hard-resetting and retrying once…")
+                await asyncio.sleep(1.5)  # let Discord drop the bad session
+                voice_client = await connect_voice_fresh(interaction.guild, voice_channel)
+                await asyncio.sleep(0.5)
+            else:
+                logger.error(f"Unexpected ConnectionClosed during start: {e}")
+                new_view = TranscriptionView(self.bot, gid)
+                await interaction.message.edit(
+                    embed=new_view.get_status_embed("❌ Error", "Voice gateway closed unexpectedly."),
+                    view=new_view,
+                )
+                try:
+                    await interaction.followup.send("❌ Voice gateway closed unexpectedly.", ephemeral=True)
+                except Exception:
+                    pass
+                return
+
+        except VoiceConnectError as e:
+            logger.error(f"Voice connection failed: {e}")
+            new_view = TranscriptionView(self.bot, gid)
+            await interaction.message.edit(
+                embed=new_view.get_status_embed("❌ Error", str(e)),
+                view=new_view,
+            )
+            try:
+                await interaction.followup.send(f"⚠️ {e}", ephemeral=True)
+            except Exception:
+                pass
+            return
+
+        except Exception as e:
+            logger.error(f"Unexpected error starting recording: {e}")
+            new_view = TranscriptionView(self.bot, gid)
+            await interaction.message.edit(
+                embed=new_view.get_status_embed("❌ Error", "An unexpected error occurred"),
+                view=new_view,
+            )
+            try:
+                await interaction.followup.send("❌ Unexpected error while starting.", ephemeral=True)
+            except Exception:
+                pass
+            return
+
+        # ---- Start recording if we got here ----
+        try:
             sink = TranscriptionSink(self.bot, transcript_channel)
             self.bot.active_sessions[gid] = sink
 
@@ -223,7 +282,6 @@ class TranscriptionView(discord.ui.View):
             async def _on_finish(_sink_obj, *args, **kwargs):
                 logger.info("Recording finished")
                 try:
-                    # If this is still the active sink, clean it and update UI
                     if self.bot.active_sessions.get(gid) is _sink_obj:
                         _sink_obj.cleanup()
                         self.bot.active_sessions.pop(gid, None)
@@ -254,26 +312,15 @@ class TranscriptionView(discord.ui.View):
                 )
             )
 
-        except VoiceConnectError as e:
-            logger.error(f"Voice connection failed: {e}")
-            new_view = TranscriptionView(self.bot, gid)
-            await interaction.message.edit(
-                embed=new_view.get_status_embed("❌ Error", str(e)),
-                view=new_view,
-            )
-            try:
-                await interaction.followup.send(f"⚠️ {e}", ephemeral=True)
-            except Exception:
-                pass
         except Exception as e:
-            logger.error(f"Unexpected error starting recording: {e}")
+            logger.error(f"Failed to start recording after connect: {e}")
             new_view = TranscriptionView(self.bot, gid)
             await interaction.message.edit(
-                embed=new_view.get_status_embed("❌ Error", "An unexpected error occurred"),
+                embed=new_view.get_status_embed("❌ Error", "Failed to start recording."),
                 view=new_view,
             )
             try:
-                await interaction.followup.send("❌ Unexpected error while starting.", ephemeral=True)
+                await interaction.followup.send("❌ Failed to start recording.", ephemeral=True)
             except Exception:
                 pass
 
