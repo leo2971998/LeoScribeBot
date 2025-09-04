@@ -15,25 +15,26 @@ import discord
 from discord.ext import tasks
 import speech_recognition as sr
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Logging
-# ─────────────────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("LeoScribeBot")
+# Uncomment for very chatty logs:
+# logging.getLogger("discord").setLevel(logging.DEBUG)
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Local modules
-# ─────────────────────────────────────────────────────────────────────────────
 from storage import GuildStore
 from voice_utils import ensure_opus_loaded, connect_voice_fresh, VoiceConnectError
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────────────────────────────────────
 def utcnow():
     return discord.utils.utcnow()
 
+async def _safe_defer(interaction: discord.Interaction):
+    """Ack the interaction quickly to avoid 10062 Unknown interaction."""
+    if not interaction.response.is_done():
+        try:
+            await interaction.response.defer()
+        except Exception:
+            pass
 
 class UserAudioBuffer:
     def __init__(self, user_id: int):
@@ -56,12 +57,11 @@ class UserAudioBuffer:
     def is_silent(self, threshold_seconds: float = 1.5) -> bool:
         return time.time() - self.last_received > threshold_seconds
 
-
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────
 # Pycord WaveSink for recording
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────
 class TranscriptionSink(discord.sinks.WaveSink):
-    def __init__(self, bot, channel):
+    def __init__(self, bot: "LeoScribeBot", channel: discord.abc.Messageable):
         super().__init__()
         self.bot = bot
         self.channel = channel
@@ -69,25 +69,24 @@ class TranscriptionSink(discord.sinks.WaveSink):
         self.recognizer = sr.Recognizer()
         self.processing = True
 
-    # NOTE: Pycord passes (pcm_bytes, user_id:int)
+    # Pycord calls write(pcm_bytes: bytes, user_id: int)
     def write(self, pcm_bytes: bytes, user_id: int):
         if not self.processing:
             return
         if user_id not in self.user_buffers:
             self.user_buffers[user_id] = UserAudioBuffer(user_id)
-        # Append decoded PCM bytes directly
         self.user_buffers[user_id].add_audio(pcm_bytes)
 
     async def transcribe_and_send(self, user_id: int, audio_data: bytes):
         if not audio_data:
             return
         try:
-            # Wrap raw PCM into a WAV container for SpeechRecognition
+            # Wrap PCM in WAV container so SpeechRecognition can read it
             audio_io = io.BytesIO()
-            with wave.open(audio_io, 'wb') as wav_file:
-                wav_file.setnchannels(2)    # Pycord decodes to stereo 48k/16-bit
-                wav_file.setsampwidth(2)
-                wav_file.setframerate(48000)
+            with wave.open(audio_io, "wb") as wav_file:
+                wav_file.setnchannels(2)      # stereo
+                wav_file.setsampwidth(2)      # 16-bit
+                wav_file.setframerate(48000)  # Discord sample rate
                 wav_file.writeframes(audio_data)
             audio_io.seek(0)
 
@@ -96,31 +95,26 @@ class TranscriptionSink(discord.sinks.WaveSink):
             text = self.recognizer.recognize_google(audio)
 
             if text.strip():
-                # Try to resolve a nice display name
-                user_obj = None
+                # Best effort to resolve display name
+                username = f"User {user_id}"
                 try:
-                    # Best: member in this guild (has display_name/nick)
-                    user_obj = getattr(self.channel, "guild", None)
-                    user_obj = user_obj.get_member(user_id) if user_obj else None
+                    guild = getattr(self.channel, "guild", None)
+                    user_obj = None
+                    if guild:
+                        user_obj = guild.get_member(user_id)
                     if not user_obj:
-                        # Cache
                         user_obj = self.bot.get_user(user_id)
                     if not user_obj:
-                        # API fallback
                         user_obj = await self.bot.fetch_user(user_id)
+                    if user_obj:
+                        username = getattr(user_obj, "display_name", None) or getattr(user_obj, "name", username)
                 except Exception:
-                    user_obj = None
-
-                username = (
-                    getattr(user_obj, "display_name", None)
-                    or getattr(user_obj, "name", None)
-                    or f"User {user_id}"
-                )
+                    pass
 
                 embed = discord.Embed(
                     description=f"**{username}:** {text}",
-                    color=0x3498db,
-                    timestamp=discord.utils.utcnow()
+                    color=0x3498DB,
+                    timestamp=utcnow(),
                 )
                 await self.channel.send(embed=embed)
 
@@ -133,9 +127,10 @@ class TranscriptionSink(discord.sinks.WaveSink):
 
     def cleanup(self):
         self.processing = False
-# ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────
 # Control Panel View
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────
 class TranscriptionView(discord.ui.View):
     """Interactive button panel for transcription control"""
 
@@ -178,20 +173,21 @@ class TranscriptionView(discord.ui.View):
 
     async def start_callback(self, interaction: discord.Interaction):
         """Handle start button click"""
+        await _safe_defer(interaction)
         gid = interaction.guild.id if interaction.guild else self.guild_id
 
         if not interaction.user.voice:
-            await interaction.response.send_message(
-                "❌ You need to be in a voice channel to start transcription!",
-                ephemeral=True,
-            )
+            try:
+                await interaction.followup.send("❌ You need to be in a voice channel to start transcription!", ephemeral=True)
+            except Exception:
+                pass
             return
 
         if gid not in self.bot.transcription_channels:
-            await interaction.response.send_message(
-                "⚠️ Please run `/setup` first so I know where to post transcripts.",
-                ephemeral=True,
-            )
+            try:
+                await interaction.followup.send("⚠️ Please run `/setup` first so I know where to post transcripts.", ephemeral=True)
+            except Exception:
+                pass
             return
 
         voice_channel = interaction.user.voice.channel
@@ -199,66 +195,73 @@ class TranscriptionView(discord.ui.View):
         transcript_channel = self.bot.get_channel(channel_id)
 
         if transcript_channel is None:
-            await interaction.response.send_message(
-                "❌ I can't access the configured transcription channel. Check my permissions.",
-                ephemeral=True,
-            )
+            try:
+                await interaction.followup.send("❌ I can't access the configured transcription channel. Check my permissions.", ephemeral=True)
+            except Exception:
+                pass
             return
 
         try:
-            # Robust fresh-voice connect with retries/backoff
             voice_client = await connect_voice_fresh(interaction.guild, voice_channel)
-            await asyncio.sleep(0.5)  # small grace period
+            await asyncio.sleep(0.5)
 
-            # Create sink and start recording
             sink = TranscriptionSink(self.bot, transcript_channel)
             self.bot.active_sessions[gid] = sink
 
-            def _on_finish(sink_obj, *args, **kwargs):
+            def _on_finish(_sink_obj, *args, **kwargs):
                 logger.info("Recording finished")
 
             voice_client.start_recording(sink, _on_finish)
 
-            # Replace panel with stateful version
             new_view = TranscriptionView(self.bot, gid)
-            await interaction.response.edit_message(
+            await interaction.message.edit(
                 embed=new_view.get_status_embed("🔴 Recording Active", voice_channel.name),
                 view=new_view,
             )
 
-            # Notify in transcript channel
-            notify = discord.Embed(
-                description=f"🔴 **Recording started** in {voice_channel.mention}",
-                color=0xFF0000,
-                timestamp=utcnow(),
+            await transcript_channel.send(
+                embed=discord.Embed(
+                    description=f"🔴 **Recording started** in {voice_channel.mention}",
+                    color=0xFF0000,
+                    timestamp=utcnow(),
+                )
             )
-            await transcript_channel.send(embed=notify)
 
         except VoiceConnectError as e:
             logger.error(f"Voice connection failed: {e}")
-            if not interaction.response.is_done():
-                new_view = TranscriptionView(self.bot, gid)
-                await interaction.response.edit_message(
-                    embed=new_view.get_status_embed("❌ Error", str(e)),
-                    view=new_view,
-                )
+            new_view = TranscriptionView(self.bot, gid)
+            await interaction.message.edit(
+                embed=new_view.get_status_embed("❌ Error", str(e)),
+                view=new_view,
+            )
+            try:
+                await interaction.followup.send(f"⚠️ {e}", ephemeral=True)
+            except Exception:
+                pass
         except Exception as e:
             logger.error(f"Unexpected error starting recording: {e}")
-            if not interaction.response.is_done():
-                new_view = TranscriptionView(self.bot, gid)
-                await interaction.response.edit_message(
-                    embed=new_view.get_status_embed("❌ Error", "An unexpected error occurred"),
-                    view=new_view,
-                )
+            new_view = TranscriptionView(self.bot, gid)
+            await interaction.message.edit(
+                embed=new_view.get_status_embed("❌ Error", "An unexpected error occurred"),
+                view=new_view,
+            )
+            try:
+                await interaction.followup.send("❌ Unexpected error while starting.", ephemeral=True)
+            except Exception:
+                pass
 
     async def stop_callback(self, interaction: discord.Interaction):
         """Handle stop button click"""
+        await _safe_defer(interaction)
         gid = interaction.guild.id if interaction.guild else self.guild_id
 
         try:
             voice_client = interaction.guild.voice_client
             if voice_client:
-                voice_client.stop_recording()
+                try:
+                    voice_client.stop_recording()
+                except Exception:
+                    pass
                 await voice_client.disconnect()
 
             if gid in self.bot.active_sessions:
@@ -267,7 +270,7 @@ class TranscriptionView(discord.ui.View):
                 del self.bot.active_sessions[gid]
 
             new_view = TranscriptionView(self.bot, gid)
-            await interaction.response.edit_message(
+            await interaction.message.edit(
                 embed=new_view.get_status_embed("⏹️ Recording Stopped", "Ready for next session"),
                 view=new_view,
             )
@@ -275,40 +278,41 @@ class TranscriptionView(discord.ui.View):
             channel_id = self.bot.transcription_channels.get(gid)
             transcript_channel = self.bot.get_channel(channel_id) if channel_id else None
             if transcript_channel:
-                notify = discord.Embed(
-                    description="⏹️ **Recording stopped**\n💡 *Tip: Click 'Clear Chat' to prepare for your next session*",
-                    color=0x808080,
-                    timestamp=utcnow(),
+                await transcript_channel.send(
+                    embed=discord.Embed(
+                        description="⏹️ **Recording stopped**\n💡 *Tip: Click 'Clear Chat' to prepare for your next session*",
+                        color=0x808080,
+                        timestamp=utcnow(),
+                    )
                 )
-                await transcript_channel.send(embed=notify)
 
         except Exception as e:
             logger.error(f"Error stopping transcription: {e}")
-            if not interaction.response.is_done():
-                await interaction.response.send_message(
-                    "❌ An error occurred while stopping transcription.",
-                    ephemeral=True,
-                )
+            try:
+                await interaction.followup.send("❌ An error occurred while stopping transcription.", ephemeral=True)
+            except Exception:
+                pass
 
     async def clear_callback(self, interaction: discord.Interaction):
         """Handle clear button click"""
+        await _safe_defer(interaction)
         gid = interaction.guild.id if interaction.guild else self.guild_id
 
         if not interaction.user.guild_permissions.manage_messages:
-            await interaction.response.send_message(
-                "❌ You need 'Manage Messages' permission to clear the chat.",
-                ephemeral=True,
-            )
+            try:
+                await interaction.followup.send("❌ You need 'Manage Messages' permission to clear the chat.", ephemeral=True)
+            except Exception:
+                pass
             return
 
         try:
             channel_id = self.bot.transcription_channels.get(gid)
             transcript_channel = self.bot.get_channel(channel_id) if channel_id else None
             if transcript_channel is None:
-                await interaction.response.send_message(
-                    "⚠️ No transcription channel configured. Run `/setup` first.",
-                    ephemeral=True,
-                )
+                try:
+                    await interaction.followup.send("⚠️ No transcription channel configured. Run `/setup` first.", ephemeral=True)
+                except Exception:
+                    pass
                 return
 
             deleted_count = 0
@@ -321,10 +325,10 @@ class TranscriptionView(discord.ui.View):
                 except Exception:
                     pass
 
-            await interaction.response.send_message(
-                f"✅ Cleared {deleted_count} messages from the transcription channel!",
-                ephemeral=True,
-            )
+            try:
+                await interaction.followup.send(f"✅ Cleared {deleted_count} messages from the transcription channel!", ephemeral=True)
+            except Exception:
+                pass
 
             welcome = discord.Embed(
                 title="🎤 LeoScribeBot Transcription Channel",
@@ -336,11 +340,10 @@ class TranscriptionView(discord.ui.View):
 
         except Exception as e:
             logger.error(f"Error clearing messages: {e}")
-            if not interaction.response.is_done():
-                await interaction.response.send_message(
-                    "❌ An error occurred while clearing messages.",
-                    ephemeral=True,
-                )
+            try:
+                await interaction.followup.send("❌ An error occurred while clearing messages.", ephemeral=True)
+            except Exception:
+                pass
 
     def get_status_embed(self, status: str, details: str = "") -> discord.Embed:
         embed = discord.Embed(
@@ -358,10 +361,9 @@ class TranscriptionView(discord.ui.View):
         )
         return embed
 
-
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────
 # Bot
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────
 class LeoScribeBot(discord.Bot):
     def __init__(self):
         intents = discord.Intents.default()
@@ -436,20 +438,16 @@ class LeoScribeBot(discord.Bot):
         self.active_sessions.pop(guild.id, None)
         self.control_panels.pop(guild.id, None)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────
 # Slash Commands
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────
 bot = LeoScribeBot()
 
 @bot.slash_command(name="setup", description="Create a dedicated channel with interactive controls")
 async def setup_command(ctx: discord.ApplicationContext):
     """Create (or reuse) a transcription channel and post the control panel."""
     if not ctx.user.guild_permissions.manage_channels:
-        await ctx.respond(
-            "❌ You need 'Manage Channels' permission to use this command.",
-            ephemeral=True,
-        )
+        await ctx.respond("❌ You need 'Manage Channels' permission to use this command.", ephemeral=True)
         return
 
     guild = ctx.guild
@@ -467,10 +465,7 @@ async def setup_command(ctx: discord.ApplicationContext):
         bot.control_panels[guild.id] = control_message.id
         bot.store.set_panel(guild.id, control_message.id)
 
-        await ctx.respond(
-            f"✅ Using existing channel {existing_channel.mention} with fresh control panel!",
-            ephemeral=True,
-        )
+        await ctx.respond(f"✅ Using existing channel {existing_channel.mention} with fresh control panel!", ephemeral=True)
         return
 
     try:
@@ -496,27 +491,15 @@ async def setup_command(ctx: discord.ApplicationContext):
         )
         await channel.send(embed=welcome)
 
-        await ctx.respond(
-            f"✅ Created transcription channel {channel.mention} with interactive controls!",
-            ephemeral=True,
-        )
+        await ctx.respond(f"✅ Created transcription channel {channel.mention} with interactive controls!", ephemeral=True)
 
     except discord.Forbidden:
-        await ctx.respond(
-            "❌ I don't have permission to create channels. Please check my permissions.",
-            ephemeral=True,
-        )
+        await ctx.respond("❌ I don't have permission to create channels. Please check my permissions.", ephemeral=True)
     except Exception as e:
         logger.error(f"Error creating channel: {e}")
-        await ctx.respond(
-            "❌ An error occurred while creating the channel.",
-            ephemeral=True,
-        )
+        await ctx.respond("❌ An error occurred while creating the channel.", ephemeral=True)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Entrypoint
-# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     from dotenv import load_dotenv
     load_dotenv()
