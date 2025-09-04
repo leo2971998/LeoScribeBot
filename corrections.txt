@@ -29,6 +29,8 @@ search binding > Surgebinding
 surge binding > Surgebinding
 search binder > Surgebinder
 surge binder > Surgebinder
+search binders > Surgebinders
+surge binders > Surgebinders
 investiture > Investiture
 investature > Investiture
 storm light > Stormlight
@@ -43,6 +45,7 @@ cryptic > Cryptic
 krem > Crem
 
 --- Geography & Peoples ---
+roche > Roshar
 rochelle > Roshar
 rochar > Roshar
 aleth car > Alethkar
