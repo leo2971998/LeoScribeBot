@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import asyncio
-import collections
+import os
 import io
-import logging
 import time
 import wave
+import asyncio
+import logging
+import collections
+from pathlib import Path
 from typing import Dict
 
 import discord
@@ -19,12 +21,17 @@ import speech_recognition as sr
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("LeoScribeBot")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Local modules
+# ─────────────────────────────────────────────────────────────────────────────
+from storage import GuildStore
+from voice_utils import ensure_opus_loaded, connect_voice_fresh, VoiceConnectError
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 def utcnow():
-    # Pycord exposes discord.utils.utcnow()
     return discord.utils.utcnow()
 
 
@@ -51,7 +58,7 @@ class UserAudioBuffer:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Voice Sink (Pycord)
+# Pycord WaveSink for recording
 # ─────────────────────────────────────────────────────────────────────────────
 class TranscriptionSink(discord.sinks.WaveSink):
     def __init__(self, bot: "LeoScribeBot", channel: discord.abc.Messageable):
@@ -67,14 +74,14 @@ class TranscriptionSink(discord.sinks.WaveSink):
             return
         if user.id not in self.user_buffers:
             self.user_buffers[user.id] = UserAudioBuffer(user.id)
-        # Raw PCM from Pycord (48kHz 16-bit stereo)
+        # Pycord provides raw 48kHz 16-bit stereo PCM as data.raw_data
         self.user_buffers[user.id].add_audio(data.raw_data)
 
     async def transcribe_and_send(self, user_id: int, audio_data: bytes):
         if not audio_data:
             return
         try:
-            # Wrap raw PCM -> WAV container (48kHz, 16-bit, stereo)
+            # Wrap PCM in WAV container so SpeechRecognition can read it
             audio_io = io.BytesIO()
             with wave.open(audio_io, "wb") as wav_file:
                 wav_file.setnchannels(2)
@@ -83,7 +90,7 @@ class TranscriptionSink(discord.sinks.WaveSink):
                 wav_file.writeframes(audio_data)
             audio_io.seek(0)
 
-            # SpeechRecognition (Google)
+            # Transcribe via Google SpeechRecognition backend
             with sr.AudioFile(audio_io) as source:
                 audio = self.recognizer.record(source)
             text = self.recognizer.recognize_google(audio)
@@ -109,12 +116,6 @@ class TranscriptionSink(discord.sinks.WaveSink):
         self.processing = False
 
 
-# Finish callback for Pycord's start_recording
-def _on_finish(_sink: TranscriptionSink, *_args, **_kwargs):
-    # We stream & transcribe on-the-fly; nothing else needed on finish.
-    pass
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Control Panel View
 # ─────────────────────────────────────────────────────────────────────────────
@@ -130,7 +131,6 @@ class TranscriptionView(discord.ui.View):
     def update_buttons(self):
         is_active = self.guild_id in self.bot.active_sessions
 
-        # Rebuild buttons
         self.clear_items()
 
         start_button = discord.ui.Button(
@@ -170,7 +170,6 @@ class TranscriptionView(discord.ui.View):
             )
             return
 
-        # Ensure /setup has been run
         if gid not in self.bot.transcription_channels:
             await interaction.response.send_message(
                 "⚠️ Please run `/setup` first so I know where to post transcripts.",
@@ -179,34 +178,31 @@ class TranscriptionView(discord.ui.View):
             return
 
         voice_channel = interaction.user.voice.channel
+        channel_id = self.bot.transcription_channels[gid]
+        transcript_channel = self.bot.get_channel(channel_id)
+
+        if transcript_channel is None:
+            await interaction.response.send_message(
+                "❌ I can't access the configured transcription channel. Check my permissions.",
+                ephemeral=True,
+            )
+            return
 
         try:
-            # Get transcription channel
-            channel_id = self.bot.transcription_channels[gid]
-            transcript_channel = self.bot.get_channel(channel_id)
-            if transcript_channel is None:
-                await interaction.response.send_message(
-                    "❌ I can't access the configured transcription channel. Check my permissions.",
-                    ephemeral=True,
-                )
-                return
+            # Robust fresh-voice connect with retries/backoff
+            voice_client = await connect_voice_fresh(interaction.guild, voice_channel)
+            await asyncio.sleep(0.5)  # small grace period
 
-            # Connect to voice channel (reuse existing if already connected)
-            voice_client = interaction.guild.voice_client
-            if voice_client and voice_client.channel != voice_channel:
-                await voice_client.disconnect(force=True)
-                voice_client = None
-            if voice_client is None:
-                voice_client = await voice_channel.connect()
-
-            # Create transcription sink
+            # Create sink and start recording
             sink = TranscriptionSink(self.bot, transcript_channel)
             self.bot.active_sessions[gid] = sink
 
-            # Start recording (provide a finish callback)
+            def _on_finish(sink_obj, *args, **kwargs):
+                logger.info("Recording finished")
+
             voice_client.start_recording(sink, _on_finish)
 
-            # Replace panel with a fresh view reflecting new state
+            # Replace panel with stateful version
             new_view = TranscriptionView(self.bot, gid)
             await interaction.response.edit_message(
                 embed=new_view.get_status_embed("🔴 Recording Active", voice_channel.name),
@@ -221,37 +217,44 @@ class TranscriptionView(discord.ui.View):
             )
             await transcript_channel.send(embed=notify)
 
-        except Exception as e:
-            logger.error(f"Error starting transcription: {e}")
+        except VoiceConnectError as e:
+            logger.error(f"Voice connection failed: {e}")
             if not interaction.response.is_done():
-                await interaction.response.send_message(
-                    "❌ An error occurred while starting transcription. Check my permissions.",
-                    ephemeral=True,
+                new_view = TranscriptionView(self.bot, gid)
+                await interaction.response.edit_message(
+                    embed=new_view.get_status_embed("❌ Error", str(e)),
+                    view=new_view,
+                )
+        except Exception as e:
+            logger.error(f"Unexpected error starting recording: {e}")
+            if not interaction.response.is_done():
+                new_view = TranscriptionView(self.bot, gid)
+                await interaction.response.edit_message(
+                    embed=new_view.get_status_embed("❌ Error", "An unexpected error occurred"),
+                    view=new_view,
                 )
 
     async def stop_callback(self, interaction: discord.Interaction):
         """Handle stop button click"""
         gid = interaction.guild.id if interaction.guild else self.guild_id
+
         try:
             voice_client = interaction.guild.voice_client
             if voice_client:
                 voice_client.stop_recording()
                 await voice_client.disconnect()
 
-            # Cleanup session
             if gid in self.bot.active_sessions:
                 sink: TranscriptionSink = self.bot.active_sessions[gid]
                 sink.cleanup()
                 del self.bot.active_sessions[gid]
 
-            # Replace panel with a fresh view reflecting idle state
             new_view = TranscriptionView(self.bot, gid)
             await interaction.response.edit_message(
                 embed=new_view.get_status_embed("⏹️ Recording Stopped", "Ready for next session"),
                 view=new_view,
             )
 
-            # Notify in transcript channel
             channel_id = self.bot.transcription_channels.get(gid)
             transcript_channel = self.bot.get_channel(channel_id) if channel_id else None
             if transcript_channel:
@@ -347,23 +350,49 @@ class LeoScribeBot(discord.Bot):
         intents = discord.Intents.default()
         intents.message_content = True
         intents.voice_states = True
-
-        # In Pycord, prefix is optional; we use slash commands.
         super().__init__(intents=intents)
 
+        # Runtime state
         self.transcription_channels: Dict[int, int] = {}         # guild_id -> channel_id
         self.active_sessions: Dict[int, TranscriptionSink] = {}  # guild_id -> sink
         self.control_panels: Dict[int, int] = {}                 # guild_id -> message_id
 
+        # Persisted config
+        data_dir = Path(__file__).parent / "data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        self.store = GuildStore(data_dir / "guild_store.json")
+
+        # Load saved channels
+        for gid_str, ch_id in self.store.get_channels().items():
+            self.transcription_channels[int(gid_str)] = ch_id
+
+        # Voice deps
+        ensure_opus_loaded()
+
     async def setup_hook(self):
-        # Register a "template" persistent view so buttons keep working after restarts.
-        # We rebuild a guild-specific view on each click anyway.
+        # Register a generic persistent view so custom_id callbacks are active after restart
         self.add_view(TranscriptionView(self, 0))
         await self.sync_commands()
         logger.info("Slash commands synced!")
 
     async def on_ready(self):
         logger.info(f"{self.user} has connected to Discord!")
+
+        # Optionally refresh panels in saved guilds
+        for gid, ch_id in self.transcription_channels.items():
+            ch = self.get_channel(ch_id)
+            if ch:
+                view = TranscriptionView(self, gid)
+                try:
+                    await ch.send(
+                        embed=view.get_status_embed("⚪ Ready", "Restored after restart"),
+                        view=view,
+                    )
+                except discord.Forbidden:
+                    logger.warning(f"No permission to send to channel {ch_id} in guild {gid}")
+                except Exception as e:
+                    logger.error(f"Error sending startup message: {e}")
+
         if not self.check_for_silence.is_running():
             self.check_for_silence.start()
 
@@ -383,16 +412,22 @@ class LeoScribeBot(discord.Bot):
     async def before_check_for_silence(self):
         await self.wait_until_ready()
 
+    async def on_guild_remove(self, guild: discord.Guild):
+        """Clean up persisted data when the bot leaves a guild."""
+        self.store.remove_guild(guild.id)
+        self.transcription_channels.pop(guild.id, None)
+        self.active_sessions.pop(guild.id, None)
+        self.control_panels.pop(guild.id, None)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Slash commands (Pycord)
+# Slash Commands
 # ─────────────────────────────────────────────────────────────────────────────
 bot = LeoScribeBot()
 
-
 @bot.slash_command(name="setup", description="Create a dedicated channel with interactive controls")
 async def setup_command(ctx: discord.ApplicationContext):
-    """Create a dedicated transcription channel with control panel."""
+    """Create (or reuse) a transcription channel and post the control panel."""
     if not ctx.user.guild_permissions.manage_channels:
         await ctx.respond(
             "❌ You need 'Manage Channels' permission to use this command.",
@@ -403,17 +438,17 @@ async def setup_command(ctx: discord.ApplicationContext):
     guild = ctx.guild
     channel_name = "leo-scribebot"
 
-    # Check if channel already exists
     existing_channel = discord.utils.get(guild.text_channels, name=channel_name)
     if existing_channel:
         bot.transcription_channels[guild.id] = existing_channel.id
+        bot.store.set_channel(guild.id, existing_channel.id)
 
-        # Create new control panel
         view = TranscriptionView(bot, guild.id)
         embed = view.get_status_embed("⚪ Ready", "Waiting to start")
-
         control_message = await existing_channel.send(embed=embed, view=view)
+
         bot.control_panels[guild.id] = control_message.id
+        bot.store.set_panel(guild.id, control_message.id)
 
         await ctx.respond(
             f"✅ Using existing channel {existing_channel.mention} with fresh control panel!",
@@ -422,21 +457,21 @@ async def setup_command(ctx: discord.ApplicationContext):
         return
 
     try:
-        # Create the channel
         channel = await guild.create_text_channel(
             channel_name,
             topic="Real-time voice chat transcriptions by LeoScribeBot 🎤📝",
             reason="LeoScribeBot transcription channel",
         )
         bot.transcription_channels[guild.id] = channel.id
+        bot.store.set_channel(guild.id, channel.id)
 
-        # Control panel
         view = TranscriptionView(bot, guild.id)
         embed = view.get_status_embed("⚪ Ready", "Channel created successfully")
+
         control_message = await channel.send(embed=embed, view=view)
         bot.control_panels[guild.id] = control_message.id
+        bot.store.set_panel(guild.id, control_message.id)
 
-        # Welcome message
         welcome = discord.Embed(
             title="🎤 LeoScribeBot Transcription Channel",
             description="Welcome to your voice transcription channel!\n\nUse the control panel above to manage recording sessions.",
@@ -466,8 +501,9 @@ async def setup_command(ctx: discord.ApplicationContext):
 # Entrypoint
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    import os
     from dotenv import load_dotenv
-
     load_dotenv()
-    bot.run(os.getenv("DISCORD_TOKEN"))
+    token = os.getenv("DISCORD_TOKEN")
+    if not token:
+        raise SystemExit("DISCORD_TOKEN not set")
+    bot.run(token)
