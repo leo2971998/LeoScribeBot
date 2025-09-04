@@ -1,3 +1,5 @@
+# requirements.txt
+
 py-cord[voice]>=2.6.1,<2.8
 PyNaCl>=1.5.0
 SpeechRecognition>=3.10.0
@@ -6,6 +8,4 @@ spacy>=3.7.0
 thefuzz[speedup]>=0.19.0
 aiofiles>=23.0.0
 numpy>=1.24
-whispercpp        # ← primary binding (from_pretrained + transcribe API)
-# If you prefer the other wrapper instead, use ONE of these (not both):
-# whisper-cpp-pytho
+whisper-cpp-python
