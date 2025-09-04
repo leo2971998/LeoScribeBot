@@ -90,7 +90,7 @@ class TranscriptionSink(discord.sinks.WaveSink):
             return
         try:
             # Use optimized Whisper transcription with fallback to Google Speech Recognition
-            text = await transcribe_audio(audio_data, model_size="base")  # "base" for good speed/accuracy balance
+            text = await transcribe_audio(audio_data)
             
             if not text:  # If Whisper failed, try the original method as ultimate fallback
                 # Wrap raw PCM in WAV header for SpeechRecognition
@@ -490,7 +490,7 @@ class LeoScribeBot(discord.Bot):
             from whisper_utils import get_transcriber
             logger.info("Initializing Whisper transcriber...")
             start_time = time.time()
-            transcriber = await get_transcriber("base")  # Base model for good speed/accuracy balance
+            transcriber = await get_transcriber()  # uses WHISPER_MODEL from .env
             stats = transcriber.get_performance_stats()
             load_time = time.time() - start_time
             logger.info(f"Whisper transcriber initialized in {load_time:.2f}s")
