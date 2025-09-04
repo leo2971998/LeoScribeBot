@@ -1,7 +1,7 @@
 #!/bin/bash
-# Enhanced setup script for LeoScribeBot with optimizations and robust checks.
+# Enhanced setup script for LeoScribeBot with three-layer text correction system
 
-echo "🚀 Setting up LeoScribeBot with real-time correction..."
+echo "🚀 Setting up LeoScribeBot with three-layer text correction..."
 
 # --- Configuration: Colors for output ---
 RED='\033[0;31m'
@@ -71,8 +71,10 @@ print_success "Virtual environment activated."
 # --- Python Dependency Installation ---
 print_status "Upgrading pip..."
 pip install --upgrade pip
+
 print_status "Installing Python dependencies from requirements.txt..."
 pip install -r requirements.txt
+
 print_success "All Python dependencies are installed."
 
 # --- spaCy Model Download ---
@@ -80,27 +82,46 @@ print_status "Downloading spaCy English model (en_core_web_sm)..."
 python -m spacy download en_core_web_sm
 print_success "spaCy model downloaded."
 
+# --- Install thefuzz with speedup for Intel N95 optimization ---
+print_status "Installing thefuzz with C-extension speedup for Intel N95..."
+pip install "thefuzz[speedup]"
+print_success "thefuzz with speedup installed."
+
 # Deactivate for a clean state before finishing
 deactivate
 
 # --- Final Instructions ---
 print_success "Setup complete! 🎉"
 echo ""
-echo -e "${YELLOW}🔧 Intel N95 Optimization Notes:${NC}"
+echo -e "${YELLOW}🔧 Three-Layer Text Correction System:${NC}"
+echo "   • Layer 1: Basic transcription (Google Speech Recognition)"
+echo "   • Layer 2: Phrase corrections using spaCy Matcher"
+echo "   • Layer 3: Fuzzy word matching using thefuzz"
+echo ""
+echo -e "${YELLOW}🎮 Gaming Term Support:${NC}"
+echo "   • Stormlight Archive terms (Surgebinding, Investiture, etc.)"
+echo "   • D&D terms (classes, monsters, spells, locations)"
+echo "   • Baldur's Gate 3 character names"
+echo ""
+echo -e "${YELLOW}⚡ Intel N95 Optimizations:${NC}"
 echo "   • The bot is optimized for CPU usage, averaging <50ms for corrections."
 echo "   • Total memory usage should remain low (~100-150MB)."
 echo "   • All processing is done offline on your machine."
+echo "   • C-extension speedup for fuzzy matching."
 echo ""
 echo -e "${YELLOW}📋 Next Steps:${NC}"
 echo "   1. Create your .env file with your Discord token:"
 echo "      echo 'DISCORD_TOKEN=your_token_here' > .env"
 echo ""
-echo "   2. Start the bot using PM2 for production deployment:"
+echo "   2. Test the correction system:"
+echo "      python3 text_corrector.py"
+echo ""
+echo "   3. Start the bot using PM2 for production deployment:"
 echo "      ./start.sh"
 echo ""
-echo "   3. To view logs:"
+echo "   4. To view logs:"
 echo "      pm2 logs leoscribebot"
 echo ""
-echo "   4. To stop the bot:"
+echo "   5. To stop the bot:"
 echo "      ./stop.sh"
 
